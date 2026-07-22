@@ -41,7 +41,7 @@ def test_make_lead_agent_signature_matches_langgraph_server_factory_abi():
     assert list(inspect.signature(lead_agent_module.make_lead_agent).parameters) == ["config"]
 
 
-def test_make_lead_agent_attaches_tracing_callbacks_at_graph_root(monkeypatch):
+def test_lead_agent_still_attaches_external_callbacks_at_graph_root(monkeypatch):
     """Regression guard: tracing handlers must be appended to
     ``config["callbacks"]`` (graph invocation root), and every in-graph
     ``create_chat_model`` call must pass ``attach_tracing=False``.
@@ -73,15 +73,39 @@ def test_make_lead_agent_attaches_tracing_callbacks_at_graph_root(monkeypatch):
     config: dict = {"configurable": {"model_name": "safe-model"}}
     lead_agent_module._make_lead_agent(config, app_config=app_config)
 
-    # Handler must land on the graph invocation config so the Langfuse
-    # CallbackHandler fires ``on_chain_start(parent_run_id=None)`` and
-    # propagates ``session_id`` / ``user_id`` onto the trace.
-    assert sentinel_handler in (config.get("callbacks") or []), "build_tracing_callbacks output must be appended to config['callbacks']"
+    assert sentinel_handler in (config.get("callbacks") or [])
+    assert seen_attach_tracing and all(flag is False for flag in seen_attach_tracing)
 
-    # Every in-graph create_chat_model call must opt out of model-level
-    # tracing to avoid duplicate spans.
-    assert seen_attach_tracing, "_make_lead_agent did not call create_chat_model"
-    assert all(flag is False for flag in seen_attach_tracing), f"in-graph create_chat_model must pass attach_tracing=False; got {seen_attach_tracing}"
+
+def test_in_graph_models_keep_attach_tracing_false(monkeypatch):
+    app_config = _make_app_config([_make_model("summary-model", supports_thinking=False)])
+    app_config.summarization = SummarizationConfig(enabled=True, model_name="summary-model")
+    app_config.memory = MemoryConfig(enabled=False)
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_chat_model(*, name=None, thinking_enabled, reasoning_effort=None, app_config=None, attach_tracing=True):
+        captured["name"] = name
+        captured["thinking_enabled"] = thinking_enabled
+        captured["app_config"] = app_config
+        captured["attach_tracing"] = attach_tracing
+        fake_model = MagicMock()
+        fake_model.with_config.return_value = fake_model
+        return fake_model
+
+    monkeypatch.setattr(lead_agent_module, "get_app_config", lambda: app_config)
+    monkeypatch.setattr(lead_agent_module, "create_chat_model", _fake_create_chat_model)
+    monkeypatch.setattr(lead_agent_module, "DeerFlowSummarizationMiddleware", lambda **kwargs: kwargs)
+
+    middleware = lead_agent_module._create_summarization_middleware(app_config=app_config)
+
+    assert captured == {
+        "name": "summary-model",
+        "thinking_enabled": False,
+        "app_config": app_config,
+        "attach_tracing": False,
+    }
+    assert middleware["model"].with_config.called
 
 
 def test_internal_make_lead_agent_uses_explicit_app_config(monkeypatch):

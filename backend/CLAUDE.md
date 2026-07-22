@@ -525,6 +525,14 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 
 LangSmith and Langfuse are both supported. The wiring lives in two layers:
 
+- Phoenix is not a callback provider.
+- Do not attach Phoenix at model creation inside graph runs.
+- Gateway, embedded client, and subagent graph invocation roots own the active Phoenix context.
+- A successful subagent trace must be `tools -> task -> deerflow.run -> subagent graph -> graph descendants`; a same-trace sibling boundary or a graph that bypasses its boundary is a tracing defect, not a supported linked-root shape.
+- Before subagent isolated-loop submission, `task_tool` uses the current runnable callback manager's `parent_run_id` to capture the registered Phoenix callback span as the logical handoff parent. If Phoenix is disabled or the Phoenix-owned registry cannot resolve that span, it falls back to ambient OTel carrier capture without failing the task. Both paths preserve `PHOENIX_PROPAGATE_BAGGAGE`.
+- Each `SubagentExecutor` invocation assigns a fresh UUID to the automatic graph root and binds that exact run ID, once, to the active `deerflow.run` boundary `SpanContext`. The lock-protected binding is atomically consumed on graph start or cleaned on scope exit; UUID-keyed registrations isolate parallel tasks, while ordinary model/tool/chain/retriever/LLM descendant parent resolution remains unchanged.
+- Subagent isolated-loop execution must keep explicit carrier trace/span-ID and current-context restoration tests.
+
 - `factory.py::build_tracing_callbacks()` — returns the LangChain `CallbackHandler` list for the providers currently enabled via env vars (`LANGSMITH_TRACING`, `LANGFUSE_TRACING`, etc.). The handlers are attached at the **graph invocation root** for in-graph runs (`make_lead_agent` and `DeerFlowClient.stream` both append them to `config["callbacks"]` before invoking the graph) so a single run produces one trace with all node / LLM / tool calls as child spans. Standalone callers — anything that invokes a model outside such a graph (e.g. `MemoryUpdater`) — keep `create_chat_model`'s default `attach_tracing=True`, which falls back to model-level callback attachment.
 - `metadata.py::build_langfuse_trace_metadata()` — builds the Langfuse-reserved trace attributes for `RunnableConfig.metadata`. The Langfuse v4 `langchain.CallbackHandler` lifts these onto the root trace (see its `_parse_langfuse_trace_attributes`), but only when it sees `on_chain_start(parent_run_id=None)` — which is why the callbacks have to live at the graph root, not the model.
 

@@ -1,8 +1,59 @@
 from .factory import build_tracing_callbacks
-from .metadata import build_langfuse_trace_metadata, inject_langfuse_metadata
+from .metadata import (
+    build_langfuse_trace_metadata,
+    build_phoenix_correlation_metadata,
+    build_trace_metadata,
+    inject_langfuse_metadata,
+    inject_trace_metadata,
+)
+from .otel_context import (
+    DEERFLOW_OTEL_TRACE_CONTEXT,
+    TraceContextCarrier,
+    attach_trace_context_to_config,
+    capture_current_trace_context,
+    capture_trace_context_from_span_context,
+    deserialize_trace_context,
+    extract_trace_context_from_headers,
+    serialize_trace_context,
+)
+from .phoenix import (
+    PhoenixRootContext,
+    PhoenixRootScope,
+    PhoenixRunBoundary,
+    PhoenixTracingError,
+    activate_phoenix_root_context,
+    bind_phoenix_graph_root_parent,
+    capture_current_phoenix_trace_context,
+    ensure_phoenix_tracing_initialized,
+    open_phoenix_root_scope,
+    reset_phoenix_tracing_for_tests,
+    shutdown_phoenix_tracing,
+)
 
 __all__ = [
+    "activate_phoenix_root_context",
+    "attach_trace_context_to_config",
     "build_langfuse_trace_metadata",
+    "build_phoenix_correlation_metadata",
+    "build_trace_metadata",
     "build_tracing_callbacks",
+    "bind_phoenix_graph_root_parent",
+    "capture_current_phoenix_trace_context",
+    "capture_current_trace_context",
+    "capture_trace_context_from_span_context",
+    "DEERFLOW_OTEL_TRACE_CONTEXT",
+    "deserialize_trace_context",
+    "ensure_phoenix_tracing_initialized",
+    "extract_trace_context_from_headers",
     "inject_langfuse_metadata",
+    "inject_trace_metadata",
+    "open_phoenix_root_scope",
+    "PhoenixRootContext",
+    "PhoenixRootScope",
+    "PhoenixRunBoundary",
+    "PhoenixTracingError",
+    "reset_phoenix_tracing_for_tests",
+    "shutdown_phoenix_tracing",
+    "serialize_trace_context",
+    "TraceContextCarrier",
 ]

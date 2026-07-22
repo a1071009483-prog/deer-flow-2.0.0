@@ -28,11 +28,28 @@ def clear_tracing_env(monkeypatch):
         "LANGFUSE_PUBLIC_KEY",
         "LANGFUSE_SECRET_KEY",
         "LANGFUSE_BASE_URL",
+        "PHOENIX_TRACING",
+        "PHOENIX_COLLECTOR_ENDPOINT",
+        "PHOENIX_API_KEY",
+        "PHOENIX_PROJECT_NAME",
+        "PHOENIX_AUTO_INSTRUMENT",
+        "PHOENIX_CAPTURE_CONTENT",
+        "PHOENIX_TRACE_PARENT_MODE",
+        "PHOENIX_TRACE_PARENT_REQUIRED",
+        "PHOENIX_PROPAGATE_BAGGAGE",
     ):
         monkeypatch.delenv(name, raising=False)
     reset_tracing_config()
+    try:
+        from deerflow.tracing.phoenix import reset_phoenix_tracing_for_tests
+    except ModuleNotFoundError:
+        reset_phoenix_tracing_for_tests = None
+    if reset_phoenix_tracing_for_tests is not None:
+        reset_phoenix_tracing_for_tests()
     yield
     reset_tracing_config()
+    if reset_phoenix_tracing_for_tests is not None:
+        reset_phoenix_tracing_for_tests()
 
 
 def test_build_tracing_callbacks_returns_empty_list_when_disabled(monkeypatch):
@@ -87,6 +104,40 @@ def test_build_tracing_callbacks_creates_langsmith_and_langfuse(monkeypatch):
     assert len(callbacks) == 2
     assert callbacks[0].project_name == "smith-project"
     assert callbacks[1].public_key == "pk-lf-test"
+
+
+def test_build_tracing_callbacks_initializes_phoenix_without_callback(monkeypatch):
+    phoenix_config = type(
+        "PhoenixCfg",
+        (),
+        {
+            "enabled": True,
+            "collector_endpoint": "http://localhost:6006",
+            "api_key": None,
+            "project_name": "deer-flow-test",
+            "auto_instrument": True,
+            "capture_content": False,
+        },
+    )()
+    calls = []
+
+    monkeypatch.setattr(tracing_factory, "get_enabled_tracing_providers", lambda: ["phoenix"])
+    monkeypatch.setattr(tracing_factory, "validate_enabled_tracing_providers", lambda: None)
+    monkeypatch.setattr(
+        tracing_factory,
+        "get_tracing_config",
+        lambda: type("Cfg", (), {"phoenix": phoenix_config})(),
+    )
+    monkeypatch.setattr(
+        tracing_factory,
+        "ensure_phoenix_tracing_initialized",
+        lambda config: calls.append(config),
+    )
+
+    callbacks = tracing_factory.build_tracing_callbacks()
+
+    assert callbacks == []
+    assert calls == [phoenix_config]
 
 
 def test_build_tracing_callbacks_raises_when_enabled_provider_fails(monkeypatch):

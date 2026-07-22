@@ -8,8 +8,10 @@ from langchain.chat_models import BaseChatModel
 from deerflow.config.app_config import AppConfig
 from deerflow.config.model_config import ModelConfig
 from deerflow.config.sandbox_config import SandboxConfig
+from deerflow.config.tracing_config import reset_tracing_config
 from deerflow.models import factory as factory_module
 from deerflow.models import openai_codex_provider as codex_provider_module
+from deerflow.tracing.phoenix import reset_phoenix_tracing_for_tests
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -78,6 +80,50 @@ def _patch_factory(monkeypatch, app_config: AppConfig, model_class=FakeChatModel
     monkeypatch.setattr(factory_module, "build_tracing_callbacks", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def _reset_phoenix_bookkeeping():
+    reset_phoenix_tracing_for_tests()
+    yield
+    reset_phoenix_tracing_for_tests()
+
+
+def _enable_phoenix_tracing(monkeypatch) -> None:
+    for name in (
+        "LANGSMITH_TRACING",
+        "LANGCHAIN_TRACING_V2",
+        "LANGCHAIN_TRACING",
+        "LANGSMITH_API_KEY",
+        "LANGCHAIN_API_KEY",
+        "LANGSMITH_PROJECT",
+        "LANGCHAIN_PROJECT",
+        "LANGSMITH_ENDPOINT",
+        "LANGCHAIN_ENDPOINT",
+        "LANGFUSE_TRACING",
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PHOENIX_TRACING", "true")
+    monkeypatch.setenv("PHOENIX_AUTO_INSTRUMENT", "false")
+    monkeypatch.setenv("PHOENIX_CAPTURE_CONTENT", "true")
+    reset_tracing_config()
+
+
+def _install_fake_phoenix_register(monkeypatch) -> list[dict]:
+    from phoenix import otel as phoenix_otel
+
+    calls: list[dict] = []
+    provider = object()
+
+    def register(**kwargs):
+        calls.append(kwargs)
+        return provider
+
+    monkeypatch.setattr(phoenix_otel, "register", register)
+    return calls
+
+
 # ---------------------------------------------------------------------------
 # Model selection
 # ---------------------------------------------------------------------------
@@ -112,6 +158,37 @@ def test_appends_all_tracing_callbacks(monkeypatch):
     model = factory_module.create_chat_model(name="alpha")
 
     assert model.callbacks == ["smith-callback", "langfuse-callback"]
+
+
+def test_standalone_model_creation_initializes_phoenix_once(monkeypatch):
+    cfg = _make_app_config([_make_model("alpha")])
+    monkeypatch.setattr(factory_module, "get_app_config", lambda: cfg)
+    monkeypatch.setattr(factory_module, "resolve_class", lambda path, base: FakeChatModel)
+    _enable_phoenix_tracing(monkeypatch)
+    phoenix_register_calls = _install_fake_phoenix_register(monkeypatch)
+    reset_phoenix_tracing_for_tests()
+
+    FakeChatModel.captured_kwargs = {}
+    factory_module.create_chat_model(name="alpha")
+    factory_module.create_chat_model(name="alpha")
+
+    assert len(phoenix_register_calls) == 1
+    assert phoenix_register_calls[0]["set_global_tracer_provider"] is False
+
+
+def test_standalone_model_creation_does_not_receive_phoenix_callback(monkeypatch):
+    cfg = _make_app_config([_make_model("alpha")])
+    monkeypatch.setattr(factory_module, "get_app_config", lambda: cfg)
+    monkeypatch.setattr(factory_module, "resolve_class", lambda path, base: FakeChatModel)
+    _enable_phoenix_tracing(monkeypatch)
+    phoenix_register_calls = _install_fake_phoenix_register(monkeypatch)
+    reset_phoenix_tracing_for_tests()
+
+    FakeChatModel.captured_kwargs = {}
+    model = factory_module.create_chat_model(name="alpha")
+
+    assert len(phoenix_register_calls) == 1
+    assert getattr(model, "callbacks", None) in (None, [])
 
 
 # ---------------------------------------------------------------------------

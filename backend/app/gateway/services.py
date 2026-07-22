@@ -24,6 +24,7 @@ from app.gateway.deps import get_run_context, get_run_manager, get_stream_bridge
 from app.gateway.internal_auth import INTERNAL_SYSTEM_ROLE, get_trusted_internal_owner_user_id
 from app.gateway.utils import sanitize_log_param
 from deerflow.config.app_config import get_app_config
+from deerflow.config.tracing_config import get_tracing_config
 from deerflow.runtime import (
     END_SENTINEL,
     HEARTBEAT_SENTINEL,
@@ -38,6 +39,7 @@ from deerflow.runtime import (
 )
 from deerflow.runtime.runs.naming import resolve_root_run_name
 from deerflow.runtime.user_context import reset_current_user, set_current_user
+from deerflow.tracing import attach_trace_context_to_config, extract_trace_context_from_headers
 
 logger = logging.getLogger(__name__)
 
@@ -402,6 +404,11 @@ async def start_run(
         else:
             graph_input = normalize_input(body.input)
         config = build_run_config(thread_id, body.config, body.metadata, assistant_id=body.assistant_id)
+        attach_trace_context_to_config(
+            config,
+            extract_trace_context_from_headers(request.headers),
+            include_baggage=get_tracing_config().phoenix.propagate_baggage,
+        )
 
         # Merge DeerFlow-specific context overrides into both ``configurable`` and ``context``.
         # The ``context`` field is a custom extension for the langgraph-compat layer

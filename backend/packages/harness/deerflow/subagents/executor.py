@@ -28,7 +28,15 @@ from deerflow.skills.tool_policy import filter_tools_by_skill_allowed_tools
 from deerflow.skills.types import Skill
 from deerflow.subagents.config import SubagentConfig, resolve_subagent_model_name
 from deerflow.subagents.token_collector import SubagentTokenCollector
-from deerflow.tracing import build_tracing_callbacks, inject_langfuse_metadata
+from deerflow.tracing import (
+    PhoenixRootContext,
+    TraceContextCarrier,
+    activate_phoenix_root_context,
+    bind_phoenix_graph_root_parent,
+    build_phoenix_correlation_metadata,
+    build_tracing_callbacks,
+    inject_trace_metadata,
+)
 
 if TYPE_CHECKING:
     # Imported lazily at runtime inside _build_initial_state: importing
@@ -288,6 +296,7 @@ class SubagentExecutor:
         thread_data: ThreadDataState | None = None,
         thread_id: str | None = None,
         trace_id: str | None = None,
+        otel_trace_context: TraceContextCarrier | None = None,
         user_id: str | None = None,
     ):
         """Initialize the executor.
@@ -303,6 +312,9 @@ class SubagentExecutor:
             thread_data: Thread data from parent agent.
             thread_id: Thread ID for sandbox operations.
             trace_id: Trace ID from parent for distributed tracing.
+            otel_trace_context: Captured upstream OTel carrier from the parent
+                runtime so isolated-loop executions can attach subagent traces
+                to the existing Phoenix trace tree.
             user_id: User ID captured from the parent tool's runtime context.
                 When None, the tracing layer falls back to DEFAULT_USER_ID.
         """
@@ -321,6 +333,7 @@ class SubagentExecutor:
         self.thread_id = thread_id
         # Generate trace_id if not provided (for top-level calls)
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
+        self.otel_trace_context = otel_trace_context
         self.user_id = user_id
 
         self._base_tools = _filter_tools(
@@ -528,6 +541,8 @@ class SubagentExecutor:
                 "callbacks": [collector],
                 "tags": [collector_caller],
             }
+            graph_run_id = uuid.uuid4()
+            run_config["run_id"] = graph_run_id
 
             # Inject tracing callbacks at the graph level so a single subagent run
             # produces one trace with all node / LLM / tool calls as child spans.
@@ -547,15 +562,41 @@ class SubagentExecutor:
             else:
                 assistant_id = "subagent"
 
-            # Inject Langfuse trace-attribute metadata so the subagent trace
-            # links to the parent thread and carries the correct session/user IDs.
-            inject_langfuse_metadata(
+            run_config.setdefault("run_name", assistant_id)
+
+            environment = os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT")
+            root_run_name = str(run_config.get("run_name") or assistant_id)
+            inject_trace_metadata(
                 run_config,
+                trusted_caller_tags=True,
                 thread_id=self.thread_id,
                 user_id=self.user_id,
                 assistant_id=assistant_id,
                 model_name=self.model_name,
-                environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
+                environment=environment,
+                caller_tags=run_config.get("tags"),
+                root_run_name=root_run_name,
+            )
+
+            root_context = PhoenixRootContext(
+                run_name=root_run_name,
+                session_id=self.thread_id,
+                user_id=self.user_id,
+                metadata=dict(run_config.get("metadata") or {}),
+                tags=list(run_config.get("tags") or []),
+                agent_name=assistant_id,
+                correlation_metadata=build_phoenix_correlation_metadata(
+                    thread_id=self.thread_id,
+                    user_id=self.user_id,
+                    assistant_id=assistant_id,
+                    model_name=self.model_name,
+                    environment=environment,
+                    caller_metadata=dict(run_config.get("metadata") or {}),
+                    caller_tags=[collector_caller],
+                    root_run_name=root_run_name,
+                ),
+                correlation_tags=[collector_caller],
+                upstream_context=self.otel_trace_context,
             )
 
             context: dict[str, Any] = {}
@@ -581,42 +622,46 @@ class SubagentExecutor:
                 )
                 return result
 
-            async for chunk in agent.astream(state, config=run_config, context=context, stream_mode="values"):  # type: ignore[arg-type]
-                # Cooperative cancellation: check if parent requested stop.
-                # Note: cancellation is only detected at astream iteration boundaries,
-                # so long-running tool calls within a single iteration will not be
-                # interrupted until the next chunk is yielded.
-                if result.cancel_event.is_set():
-                    logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} cancelled by parent")
-                    result.try_set_terminal(
-                        SubagentStatus.CANCELLED,
-                        error="Cancelled by user",
-                        token_usage_records=collector.snapshot_records(),
-                    )
-                    return result
+            with activate_phoenix_root_context(root_context) as boundary:
+                with bind_phoenix_graph_root_parent(graph_run_id, boundary):
+                    async for chunk in agent.astream(state, config=run_config, context=context, stream_mode="values"):  # type: ignore[arg-type]
+                        # Cooperative cancellation: check if parent requested stop.
+                        # Note: cancellation is only detected at astream iteration boundaries,
+                        # so long-running tool calls within a single iteration will not be
+                        # interrupted until the next chunk is yielded.
+                        if result.cancel_event.is_set():
+                            logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} cancelled by parent")
+                            result.try_set_terminal(
+                                SubagentStatus.CANCELLED,
+                                error="Cancelled by user",
+                                token_usage_records=collector.snapshot_records(),
+                            )
+                            return result
 
-                final_state = chunk
+                        final_state = chunk
 
-                # Extract AI messages from the current state
-                messages = chunk.get("messages", [])
-                if messages:
-                    last_message = messages[-1]
-                    # Check if this is a new AI message
-                    if isinstance(last_message, AIMessage):
-                        # Convert message to dict for serialization
-                        message_dict = last_message.model_dump()
-                        # Only add if it's not already in the list (avoid duplicates)
-                        # Check by comparing message IDs if available, otherwise compare full dict
-                        message_id = message_dict.get("id")
-                        is_duplicate = False
-                        if message_id:
-                            is_duplicate = any(msg.get("id") == message_id for msg in ai_messages)
-                        else:
-                            is_duplicate = message_dict in ai_messages
+                        # Extract AI messages from the current state
+                        messages = chunk.get("messages", [])
+                        if messages:
+                            last_message = messages[-1]
+                            # Check if this is a new AI message
+                            if isinstance(last_message, AIMessage):
+                                # Convert message to dict for serialization
+                                message_dict = last_message.model_dump()
+                                # Only add if it's not already in the list (avoid duplicates)
+                                # Check by comparing message IDs if available, otherwise compare full dict
+                                message_id = message_dict.get("id")
+                                is_duplicate = False
+                                if message_id:
+                                    is_duplicate = any(msg.get("id") == message_id for msg in ai_messages)
+                                else:
+                                    is_duplicate = message_dict in ai_messages
 
-                        if not is_duplicate:
-                            ai_messages.append(message_dict)
-                            logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} captured AI message #{len(ai_messages)}")
+                                if not is_duplicate:
+                                    ai_messages.append(message_dict)
+                                    logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} captured AI message #{len(ai_messages)}")
+                if boundary is not None:
+                    boundary.mark_complete()
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} completed async execution")
             token_usage_records = collector.snapshot_records()

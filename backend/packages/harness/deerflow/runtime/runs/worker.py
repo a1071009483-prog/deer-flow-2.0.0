@@ -30,10 +30,18 @@ if TYPE_CHECKING:
     from langchain_core.messages import HumanMessage
 
 from deerflow.config.app_config import AppConfig
+from deerflow.config.tracing_config import get_tracing_config
 from deerflow.runtime.serialization import serialize
 from deerflow.runtime.stream_bridge import StreamBridge
 from deerflow.runtime.user_context import get_effective_user_id
-from deerflow.tracing import inject_langfuse_metadata
+from deerflow.tracing import (
+    DEERFLOW_OTEL_TRACE_CONTEXT,
+    PhoenixRootContext,
+    activate_phoenix_root_context,
+    build_phoenix_correlation_metadata,
+    deserialize_trace_context,
+    inject_trace_metadata,
+)
 
 from .manager import RunManager, RunRecord
 from .naming import resolve_root_run_name
@@ -234,38 +242,67 @@ async def run_agent(
         if journal is not None:
             config.setdefault("callbacks", []).append(journal)
 
-        # Inject Langfuse trace-attribute metadata so the langchain CallbackHandler
-        # can lift session_id / user_id / trace_name / tags onto the root trace.
-        # Shared helper with ``DeerFlowClient.stream`` so both entry points stay
-        # in sync; caller-provided metadata wins via setdefault inside the helper.
-        inject_langfuse_metadata(
+        config.setdefault("run_name", resolve_root_run_name(config, record.assistant_id))
+        authoritative_assistant_id = record.assistant_id or "lead_agent"
+
+        # Inject provider-neutral root trace metadata so the worker and the
+        # embedded client stay aligned; Langfuse reserved keys continue to flow
+        # through the shared helper.
+        effective_user_id = get_effective_user_id()
+        environment = os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT")
+        caller_metadata = dict(config.get("metadata") or {})
+        inject_trace_metadata(
             config,
             thread_id=thread_id,
-            user_id=get_effective_user_id(),
-            assistant_id=record.assistant_id,
+            user_id=effective_user_id,
+            assistant_id=authoritative_assistant_id,
             model_name=record.model_name,
-            environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
+            environment=environment,
+            caller_tags=config.get("tags"),
+            root_run_name=config.get("run_name"),
+            run_id=run_id,
         )
 
         # Resolve after runtime context installation so context/configurable reflect
         # the agent name that this run will actually execute.
-        config.setdefault("run_name", resolve_root_run_name(config, record.assistant_id))
         runnable_config = RunnableConfig(**config)
         if ctx.app_config is not None and _agent_factory_supports_app_config(agent_factory):
             agent = agent_factory(config=runnable_config, app_config=ctx.app_config)
         else:
             agent = agent_factory(config=runnable_config)
 
-        # Capture the effective (resolved) model name from the agent's metadata.
-        # _resolve_model_name in agent.py may return the default model if the
-        # requested name is not in the allowlist — this update ensures the
-        # persisted model_name reflects the actual model used.
+        # Capture the effective model from the factory-mutated RunnableConfig.
+        # For a non-empty request, retain the existing agent metadata fallback
+        # because the factory may expose a remap there instead.
+        factory_metadata = runnable_config.get("metadata") or {}
+        effective_model_name = factory_metadata.get("model_name", record.model_name)
         if record.model_name is not None:
             resolved = getattr(agent, "metadata", {}) or {}
             if isinstance(resolved, dict):
                 effective = resolved.get("model_name")
                 if effective and effective != record.model_name:
                     await run_manager.update_model_name(record.run_id, effective)
+                if effective:
+                    effective_model_name = effective
+
+        # Agent factories receive a shallow RunnableConfig copy and may append
+        # metadata while resolving the model. Rebuild the safe metadata from the
+        # original caller snapshot, then update the exact config passed to astream.
+        phoenix_config = get_tracing_config().phoenix
+        if phoenix_config.enabled and not phoenix_config.capture_content:
+            config["metadata"] = caller_metadata
+            inject_trace_metadata(
+                config,
+                thread_id=thread_id,
+                user_id=effective_user_id,
+                assistant_id=authoritative_assistant_id,
+                model_name=effective_model_name,
+                environment=environment,
+                caller_tags=config.get("tags"),
+                root_run_name=config.get("run_name"),
+                run_id=run_id,
+            )
+            runnable_config["metadata"] = config["metadata"]
 
         # 4. Attach checkpointer and store
         if checkpointer is not None:
@@ -305,36 +342,69 @@ async def run_agent(
 
         logger.info("Run %s: streaming with modes %s (requested: %s)", run_id, lg_modes, requested_modes)
 
+        runtime_context_config = config.get("context")
+        upstream_context = None
+        if isinstance(runtime_context_config, dict):
+            upstream_context = deserialize_trace_context(runtime_context_config.get(DEERFLOW_OTEL_TRACE_CONTEXT))
+
+        root_run_name = str(config.get("run_name") or resolve_root_run_name(config, record.assistant_id))
+        root_context = PhoenixRootContext(
+            run_name=root_run_name,
+            session_id=thread_id,
+            user_id=effective_user_id,
+            metadata=dict(config.get("metadata") or {}),
+            tags=list(config.get("tags") or []),
+            agent_name=authoritative_assistant_id,
+            correlation_metadata=build_phoenix_correlation_metadata(
+                thread_id=thread_id,
+                user_id=effective_user_id,
+                assistant_id=authoritative_assistant_id,
+                model_name=effective_model_name,
+                environment=environment,
+                caller_metadata=dict(config.get("metadata") or {}),
+                root_run_name=root_run_name,
+                run_id=run_id,
+            ),
+            correlation_tags=[],
+            upstream_context=upstream_context,
+        )
+
         # 7. Stream using graph.astream
         if len(lg_modes) == 1 and not stream_subgraphs:
             # Single mode, no subgraphs: astream yields raw chunks
             single_mode = lg_modes[0]
-            async for chunk in agent.astream(graph_input, config=runnable_config, stream_mode=single_mode):
-                if record.abort_event.is_set():
-                    logger.info("Run %s abort requested — stopping", run_id)
-                    break
-                llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk)
-                sse_event = _lg_mode_to_sse_event(single_mode)
-                await bridge.publish(run_id, sse_event, serialize(chunk, mode=single_mode))
+            with activate_phoenix_root_context(root_context) as boundary:
+                async for chunk in agent.astream(graph_input, config=runnable_config, stream_mode=single_mode):
+                    if record.abort_event.is_set():
+                        logger.info("Run %s abort requested — stopping", run_id)
+                        break
+                    llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk)
+                    sse_event = _lg_mode_to_sse_event(single_mode)
+                    await bridge.publish(run_id, sse_event, serialize(chunk, mode=single_mode))
+                if boundary is not None and not record.abort_event.is_set():
+                    boundary.mark_complete()
         else:
             # Multiple modes or subgraphs: astream yields tuples
-            async for item in agent.astream(
-                graph_input,
-                config=runnable_config,
-                stream_mode=lg_modes,
-                subgraphs=stream_subgraphs,
-            ):
-                if record.abort_event.is_set():
-                    logger.info("Run %s abort requested — stopping", run_id)
-                    break
+            with activate_phoenix_root_context(root_context) as boundary:
+                async for item in agent.astream(
+                    graph_input,
+                    config=runnable_config,
+                    stream_mode=lg_modes,
+                    subgraphs=stream_subgraphs,
+                ):
+                    if record.abort_event.is_set():
+                        logger.info("Run %s abort requested — stopping", run_id)
+                        break
 
-                mode, chunk = _unpack_stream_item(item, lg_modes, stream_subgraphs)
-                if mode is None:
-                    continue
+                    mode, chunk = _unpack_stream_item(item, lg_modes, stream_subgraphs)
+                    if mode is None:
+                        continue
 
-                llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk)
-                sse_event = _lg_mode_to_sse_event(mode)
-                await bridge.publish(run_id, sse_event, serialize(chunk, mode=mode))
+                    llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk)
+                    sse_event = _lg_mode_to_sse_event(mode)
+                    await bridge.publish(run_id, sse_event, serialize(chunk, mode=mode))
+                if boundary is not None and not record.abort_event.is_set():
+                    boundary.mark_complete()
 
         # 8. Final status
         if record.abort_event.is_set():

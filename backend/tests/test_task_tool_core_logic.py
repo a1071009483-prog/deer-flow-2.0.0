@@ -1277,6 +1277,96 @@ def test_subagent_usage_cache_is_skipped_when_token_usage_is_disabled(monkeypatc
     assert task_tool_module.pop_cached_subagent_usage("tc-disabled-cache") is None
 
 
+@pytest.mark.parametrize(
+    ("phoenix_enabled", "expected_capture"),
+    [
+        (True, "phoenix"),
+        (False, "ambient"),
+    ],
+)
+def test_task_tool_selects_provider_aware_otel_carrier(
+    monkeypatch,
+    phoenix_enabled,
+    expected_capture,
+):
+    from deerflow.tracing import TraceContextCarrier
+
+    config = _make_subagent_config()
+    runtime = _make_runtime(app_config=SimpleNamespace(token_usage=SimpleNamespace(enabled=False)))
+    captured = {}
+    carriers = {
+        "ambient": TraceContextCarrier(
+            traceparent="00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            tracestate="ambient=value",
+            baggage="ambient=true",
+        ),
+        "phoenix": TraceContextCarrier(
+            traceparent="00-fedcba9876543210fedcba9876543210-fedcba9876543210-01",
+            tracestate="phoenix=value",
+            baggage="phoenix=true",
+        ),
+    }
+
+    class DummyExecutor:
+        def __init__(self, **kwargs):
+            captured["executor_kwargs"] = kwargs
+
+        def execute_async(self, prompt, task_id=None):
+            return task_id or "generated-task-id"
+
+    def fake_capture_current_trace_context(*, include_baggage):
+        captured.setdefault("capture_calls", []).append(("ambient", include_baggage))
+        return carriers["ambient"]
+
+    def fake_capture_current_phoenix_trace_context(*, include_baggage):
+        captured.setdefault("capture_calls", []).append(("phoenix", include_baggage))
+        return carriers["phoenix"]
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "get_available_subagent_names", lambda *, app_config: ["general-purpose"])
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _, *, app_config: config)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "capture_current_trace_context", fake_capture_current_trace_context)
+    monkeypatch.setattr(
+        task_tool_module,
+        "capture_current_phoenix_trace_context",
+        fake_capture_current_phoenix_trace_context,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_tracing_config",
+        lambda: SimpleNamespace(
+            phoenix=SimpleNamespace(
+                enabled=phoenix_enabled,
+                propagate_baggage=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.COMPLETED, result="done"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: lambda _: None)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(task_tool_module, "_report_subagent_usage", lambda *_: None)
+    monkeypatch.setattr(task_tool_module, "cleanup_background_task", lambda _: None)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", MagicMock(return_value=[]))
+
+    output = _run_task_tool(
+        runtime=runtime,
+        description="test",
+        prompt="do work",
+        subagent_type="general-purpose",
+        tool_call_id="tc-otel",
+    )
+
+    assert output == "Task Succeeded. Result: done"
+    assert captured["capture_calls"] == [(expected_capture, True)]
+    assert captured["executor_kwargs"]["otel_trace_context"] == carriers[expected_capture]
+
+
 def test_subagent_usage_cache_is_cleared_when_polling_raises(monkeypatch):
     config = _make_subagent_config()
     app_config = SimpleNamespace(token_usage=SimpleNamespace(enabled=True))

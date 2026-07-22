@@ -17,12 +17,16 @@ import asyncio
 import importlib
 import sys
 import threading
+from contextlib import contextmanager
+from contextvars import copy_context
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
+from opentelemetry.trace import StatusCode
 
 from deerflow.skills.types import Skill
 
@@ -65,6 +69,11 @@ def _setup_executor_classes():
     # Save original modules
     original_modules = {name: sys.modules.get(name) for name in _MOCKED_MODULE_NAMES}
     original_executor = sys.modules.get("deerflow.subagents.executor")
+
+    # Cache the real embedded client before the circular-import breaker below
+    # replaces ``deerflow.agents`` with test doubles. Production-entry tracing
+    # tests exercise DeerFlowClient itself and must not depend on test order.
+    from deerflow import client as _client_module  # noqa: F401
 
     # Remove mocked executor if exists (from conftest.py)
     if "deerflow.subagents.executor" in sys.modules:
@@ -2015,17 +2024,30 @@ class TestSubagentTracingWiring:
         return _patch_default_get_app_config(importlib.reload(executor))
 
     @pytest.fixture(autouse=True)
-    def _clear_langfuse_env(self, monkeypatch):
-        """Reset tracing config and env between tests so monkeypatched env
-        vars do not leak across tests in this class or the rest of the suite.
-        """
+    def _isolate_tracing_state(self, monkeypatch):
+        """Reset tracing config, provider ownership, and env between tests."""
         from deerflow.config.tracing_config import reset_tracing_config
+        from deerflow.tracing import phoenix
 
-        for name in ("LANGFUSE_TRACING", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL"):
+        phoenix.shutdown_phoenix_tracing(timeout_millis=100)
+
+        for name in (
+            "LANGFUSE_TRACING",
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+            "LANGFUSE_BASE_URL",
+            "PHOENIX_TRACING",
+            "PHOENIX_PROJECT_NAME",
+            "PHOENIX_COLLECTOR_ENDPOINT",
+            "PHOENIX_CAPTURE_CONTENT",
+        ):
             monkeypatch.delenv(name, raising=False)
         reset_tracing_config()
-        yield
-        reset_tracing_config()
+        try:
+            yield
+        finally:
+            phoenix.shutdown_phoenix_tracing(timeout_millis=100)
+            reset_tracing_config()
 
     def _make_executor(self, classes, *, user_id=None, name="general-purpose", parent_model="test-model"):
         SubagentExecutor = classes["SubagentExecutor"]
@@ -2045,6 +2067,20 @@ class TestSubagentTracingWiring:
             trace_id="trace-1",
             user_id=user_id,
         )
+
+    @staticmethod
+    @contextmanager
+    def _recorded_root_context(recorded: list):
+        def _activate(root_context):
+            recorded.append(root_context)
+
+            @contextmanager
+            def _ctx():
+                yield
+
+            return _ctx()
+
+        yield _activate
 
     @pytest.mark.anyio
     async def test_aexecute_appends_tracing_callbacks_to_run_config(
@@ -2075,6 +2111,729 @@ class TestSubagentTracingWiring:
         # cannot displace the token-accounting callback).
         assert len(callbacks) >= 2, "existing callbacks must be preserved when tracing is injected"
         assert result.status.value == SubagentStatus.COMPLETED.value
+
+    @pytest.mark.anyio
+    async def test_aexecute_enters_phoenix_root_context_with_subagent_metadata(
+        self,
+        classes,
+        executor_module,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("PHOENIX_TRACING", "true")
+        monkeypatch.setenv("PHOENIX_PROJECT_NAME", "deer-flow-tests")
+        monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.test:6006")
+        from deerflow.config.tracing_config import reset_tracing_config
+
+        reset_tracing_config()
+        monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: [])
+
+        recorded_roots = []
+        with self._recorded_root_context(recorded_roots) as fake_activate:
+            monkeypatch.setattr(executor_module, "activate_phoenix_root_context", fake_activate)
+
+            executor = self._make_executor(
+                classes,
+                user_id="alice",
+                name="general_purpose",
+                parent_model="claude-sonnet",
+            )
+            fake_agent = _FakeStreamAgent()
+            monkeypatch.setattr(executor, "_build_initial_state", self._noop_build_initial_state)
+            monkeypatch.setattr(executor, "_create_agent", lambda *a, **kw: fake_agent)
+
+            await executor._aexecute("do something")
+
+        assert len(recorded_roots) == 1
+        root = recorded_roots[0]
+        assert root.run_name == "subagent:general-purpose"
+        assert root.session_id == "thread-trace-1"
+        assert root.user_id == "alice"
+        assert root.tags == ["subagent:general_purpose"]
+        assert root.upstream_context is None
+        assert root.metadata == {
+            "session_id": "thread-trace-1",
+            "thread_id": "thread-trace-1",
+            "user_id": "alice",
+            "assistant_id": "subagent:general-purpose",
+            "model_name": "claude-sonnet",
+            "environment": None,
+            "root_run_name": "subagent:general-purpose",
+            "caller_tags": ["subagent:general_purpose"],
+        }
+        assert root.correlation_metadata == root.metadata
+        assert root.correlation_tags == ["subagent:general_purpose"]
+
+    @pytest.mark.anyio
+    async def test_aexecute_exports_distinct_boundary_and_graph_spans(
+        self,
+        classes,
+        executor_module,
+        monkeypatch,
+    ):
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        from deerflow.config.tracing_config import PhoenixTracingConfig
+        from deerflow.tracing import phoenix
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        instrumentor = LangChainInstrumentor()
+        config = PhoenixTracingConfig(
+            enabled=True,
+            collector_endpoint="http://phoenix.test:6006",
+            api_key=None,
+            project_name="deer-flow-subagent-exporter-test",
+            auto_instrument=True,
+            capture_content=True,
+            trace_parent_mode="auto",
+            trace_parent_required=False,
+            propagate_baggage=False,
+        )
+        phoenix_module = ModuleType("phoenix")
+        phoenix_module.__path__ = []
+        phoenix_otel_module = ModuleType("phoenix.otel")
+        phoenix_otel_module.register = lambda **_kwargs: provider
+        phoenix_module.otel = phoenix_otel_module
+        monkeypatch.setitem(sys.modules, "phoenix", phoenix_module)
+        monkeypatch.setitem(sys.modules, "phoenix.otel", phoenix_otel_module)
+        monkeypatch.setattr(phoenix, "get_tracing_config", lambda: SimpleNamespace(phoenix=config))
+        monkeypatch.setattr(trace, "get_tracer", provider.get_tracer)
+        phoenix.shutdown_phoenix_tracing()
+        assert not instrumentor._is_instrumented_by_opentelemetry
+        try:
+            phoenix.ensure_phoenix_tracing_initialized(config)
+            assert instrumentor._is_instrumented_by_opentelemetry
+            tracer = instrumentor._tracer
+            assert tracer is not None
+
+            class _ExporterGraphAgent:
+                async def astream(self, _state, *, config, context, stream_mode):  # noqa: ARG002 - signature parity
+                    run_id = uuid4()
+                    tracer.on_chain_start(
+                        {"name": config["run_name"]},
+                        {"input": "graph"},
+                        run_id=run_id,
+                        name=config["run_name"],
+                    )
+                    try:
+                        return
+                        yield  # pragma: no cover - make this an async generator
+                    finally:
+                        tracer.on_chain_end({"output": "graph"}, run_id=run_id)
+
+            async def initial_state(_task):
+                return ({"messages": []}, [], None)
+
+            monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: [])
+            executor = self._make_executor(classes, user_id="alice", name="general-purpose")
+            monkeypatch.setattr(executor, "_build_initial_state", initial_state)
+            monkeypatch.setattr(executor, "_create_agent", lambda *args, **kwargs: _ExporterGraphAgent())
+
+            await executor._aexecute("do something")
+            spans = exporter.get_finished_spans()
+        finally:
+            phoenix.shutdown_phoenix_tracing()
+            assert not instrumentor._is_instrumented_by_opentelemetry
+
+        boundary_spans = [span for span in spans if span.attributes.get("deerflow.span.role") == "run_boundary"]
+        assert len(boundary_spans) == 1
+        boundary = boundary_spans[0]
+        assert boundary.name == "deerflow.run"
+        assert boundary.status.status_code == StatusCode.OK
+        assert boundary.attributes["deerflow.agent_name"] == "subagent:general-purpose"
+        assert boundary.attributes["deerflow.root_run_name"] == "subagent:general-purpose"
+        graph_spans = [span for span in spans if span.name == "subagent:general-purpose"]
+        assert len(graph_spans) == 1
+        assert graph_spans[0].context.trace_id == boundary.context.trace_id
+        assert graph_spans[0].parent is not None
+        assert graph_spans[0].parent.span_id == boundary.context.span_id
+
+    @pytest.mark.anyio
+    async def test_aexecute_keeps_task_boundary_graph_topology_when_graph_inherits_task_parent(
+        self,
+        classes,
+        executor_module,
+        monkeypatch,
+    ):
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from test_phoenix_parent_compat import _assert_task_boundary_graph_topology
+
+        from deerflow.config.tracing_config import PhoenixTracingConfig
+        from deerflow.tracing import TraceContextCarrier, phoenix
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        instrumentor = LangChainInstrumentor()
+        config = PhoenixTracingConfig(
+            enabled=True,
+            collector_endpoint="http://phoenix.test:6006",
+            api_key=None,
+            project_name="deer-flow-subagent-parentage-test",
+            auto_instrument=True,
+            capture_content=True,
+            trace_parent_mode="auto",
+            trace_parent_required=False,
+            propagate_baggage=False,
+        )
+        phoenix_module = ModuleType("phoenix")
+        phoenix_module.__path__ = []
+        phoenix_otel_module = ModuleType("phoenix.otel")
+        phoenix_otel_module.register = lambda **_kwargs: provider
+        phoenix_module.otel = phoenix_otel_module
+        monkeypatch.setitem(sys.modules, "phoenix", phoenix_module)
+        monkeypatch.setitem(sys.modules, "phoenix.otel", phoenix_otel_module)
+        monkeypatch.setattr(phoenix, "get_tracing_config", lambda: SimpleNamespace(phoenix=config))
+        monkeypatch.setattr(trace, "get_tracer", provider.get_tracer)
+        phoenix.shutdown_phoenix_tracing()
+        assert not instrumentor._is_instrumented_by_opentelemetry
+        task_run_id = uuid4()
+        try:
+            phoenix.ensure_phoenix_tracing_initialized(config)
+            tracer = instrumentor._tracer
+            assert tracer is not None
+            tracer.on_chain_start(
+                {"name": "task"},
+                {"input": "delegate"},
+                run_id=task_run_id,
+                name="task",
+            )
+            task_recording_span = tracer._spans_by_run[task_run_id]
+            task_span_context = task_recording_span.get_span_context()
+            task_carrier = TraceContextCarrier(
+                traceparent=f"00-{task_span_context.trace_id:032x}-{task_span_context.span_id:016x}-01",
+            )
+
+            class _ExporterGraphAgent:
+                async def astream(self, _state, *, config, context, stream_mode):  # noqa: ARG002 - signature parity
+                    graph_run_id = config.get("run_id", uuid4())
+                    tracer.on_chain_start(
+                        {"name": config["run_name"]},
+                        {"input": "graph"},
+                        run_id=graph_run_id,
+                        parent_run_id=task_run_id,
+                        name=config["run_name"],
+                    )
+                    try:
+                        return
+                        yield  # pragma: no cover - make this an async generator
+                    finally:
+                        tracer.on_chain_end({"output": "graph"}, run_id=graph_run_id)
+
+            async def initial_state(_task):
+                return ({"messages": []}, [], None)
+
+            monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: [])
+            executor = self._make_executor(classes, user_id="alice", name="general-purpose")
+            executor.otel_trace_context = task_carrier
+            monkeypatch.setattr(executor, "_build_initial_state", initial_state)
+            monkeypatch.setattr(executor, "_create_agent", lambda *args, **kwargs: _ExporterGraphAgent())
+
+            await executor._aexecute("do something")
+            tracer.on_chain_end({"output": "delegated"}, run_id=task_run_id)
+            spans = list(exporter.get_finished_spans())
+        finally:
+            if task_run_id in getattr(instrumentor._tracer, "_spans_by_run", {}):
+                instrumentor._tracer.on_chain_end({"output": "cleanup"}, run_id=task_run_id)
+            phoenix.shutdown_phoenix_tracing()
+            assert not instrumentor._is_instrumented_by_opentelemetry
+
+        task_span = next(span for span in spans if span.name == "task")
+        boundary_span = next(span for span in spans if span.attributes.get("deerflow.span.role") == "run_boundary")
+        graph_span = next(span for span in spans if span.name == "subagent:general-purpose")
+        _assert_task_boundary_graph_topology(
+            spans,
+            task_span=task_span,
+            boundary_span=boundary_span,
+            graph_span=graph_span,
+        )
+
+    @pytest.mark.parametrize(
+        ("entry_mode", "langsmith_enabled", "task_count"),
+        [
+            ("gateway", False, 1),
+            ("gateway", True, 1),
+            ("embedded", False, 1),
+            ("embedded", True, 1),
+            ("gateway", True, 2),
+        ],
+    )
+    def test_production_entries_keep_exact_subagent_topology_across_langsmith_modes(
+        self,
+        classes,
+        executor_module,
+        monkeypatch,
+        entry_mode,
+        langsmith_enabled,
+        task_count,
+    ):
+        from langchain.agents import create_agent
+        from langchain_core.language_models import BaseChatModel
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        from langchain_core.tools import StructuredTool, tool
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from test_phoenix_parent_compat import (
+            _assert_task_boundary_graph_topology,
+            _invoke_embedded_client,
+            _make_no_network_langsmith_tracer,
+            _WorkerBridge,
+            _WorkerRunManager,
+        )
+
+        from deerflow.config.tracing_config import PhoenixTracingConfig
+        from deerflow.runtime.runs.manager import RunRecord
+        from deerflow.runtime.runs.schemas import DisconnectMode, RunStatus
+        from deerflow.runtime.runs.worker import RunContext, run_agent
+        from deerflow.tracing import capture_current_phoenix_trace_context, phoenix
+
+        class LeadModel(BaseChatModel):
+            call_count: int = 0
+
+            @property
+            def _llm_type(self) -> str:
+                return "task4-lead-local"
+
+            def bind_tools(self, tools, **kwargs):  # noqa: ARG002 - LangChain model contract
+                return self
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ARG002 - LangChain model contract
+                self.call_count += 1
+                if self.call_count == 1:
+                    message = AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": f"task4-{entry_mode}-{langsmith_enabled}-{index}",
+                                "name": "task",
+                                "args": {"prompt": f"delegate locally {index}"},
+                            }
+                            for index in range(task_count)
+                        ],
+                    )
+                else:
+                    message = AIMessage(content="lead done")
+                return ChatResult(generations=[ChatGeneration(message=message)])
+
+            async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+                return self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+        class SubagentModel(BaseChatModel):
+            call_count: int = 0
+
+            @property
+            def _llm_type(self) -> str:
+                return "task4-subagent-local"
+
+            def bind_tools(self, tools, **kwargs):  # noqa: ARG002 - LangChain model contract
+                return self
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ARG002 - LangChain model contract
+                self.call_count += 1
+                if self.call_count == 1:
+                    message = AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": f"task4-subagent-{entry_mode}-{langsmith_enabled}",
+                                "name": "task4_subagent_echo",
+                                "args": {"value": "subagent-result"},
+                            }
+                        ],
+                    )
+                else:
+                    message = AIMessage(content="subagent done")
+                return ChatResult(generations=[ChatGeneration(message=message)])
+
+            async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+                return self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+        subagent_tool_calls: list[str] = []
+
+        @tool
+        def task4_subagent_echo(value: str) -> str:
+            """Return one deterministic local subagent result."""
+            subagent_tool_calls.append(value)
+            return value
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        instrumentor = LangChainInstrumentor()
+        assert not instrumentor._is_instrumented_by_opentelemetry
+        config = PhoenixTracingConfig(
+            enabled=True,
+            collector_endpoint="http://phoenix.test:6006",
+            api_key=None,
+            project_name=f"task4-{entry_mode}-{langsmith_enabled}",
+            auto_instrument=True,
+            capture_content=True,
+            trace_parent_mode="auto",
+            trace_parent_required=False,
+            propagate_baggage=False,
+        )
+        phoenix_module = ModuleType("phoenix")
+        phoenix_module.__path__ = []
+        phoenix_otel_module = ModuleType("phoenix.otel")
+        phoenix_otel_module.register = lambda **_kwargs: provider
+        phoenix_module.otel = phoenix_otel_module
+        monkeypatch.setitem(sys.modules, "phoenix", phoenix_module)
+        monkeypatch.setitem(sys.modules, "phoenix.otel", phoenix_otel_module)
+        monkeypatch.setattr(phoenix, "get_tracing_config", lambda: SimpleNamespace(phoenix=config))
+        monkeypatch.setattr(trace, "get_tracer", provider.get_tracer)
+
+        langsmith_tracer = _make_no_network_langsmith_tracer(monkeypatch, f"task4-{entry_mode}") if langsmith_enabled else None
+        tracing_callbacks = [langsmith_tracer] if langsmith_tracer is not None else []
+        monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: list(tracing_callbacks))
+        isolated_thread_ids: list[int] = []
+        copied_run_tree_ids: list = []
+
+        async def initial_state(task):
+            from langsmith.run_helpers import get_current_run_tree
+
+            isolated_thread_ids.append(threading.get_ident())
+            current_run_tree = get_current_run_tree()
+            copied_run_tree_ids.append(current_run_tree.id if current_run_tree is not None else None)
+            return ({"messages": [HumanMessage(content=task)]}, [], None)
+
+        def new_executor():
+            executor = self._make_executor(classes, user_id="alice", name="general-purpose")
+            executor.otel_trace_context = capture_current_phoenix_trace_context(include_baggage=False)
+            subagent_agent = create_agent(
+                model=SubagentModel(),
+                tools=[task4_subagent_echo],
+            )
+            monkeypatch.setattr(executor, "_build_initial_state", initial_state)
+            monkeypatch.setattr(executor, "_create_agent", lambda *args, **kwargs: subagent_agent)
+            return executor
+
+        async def wait_async(task_id: str):
+            while True:
+                result = executor_module.get_background_task_result(task_id)
+                assert result is not None
+                if result.status.is_terminal:
+                    return result
+                await asyncio.sleep(0.001)
+
+        def wait_sync(task_id: str):
+            for _ in range(10_000):
+                result = executor_module.get_background_task_result(task_id)
+                assert result is not None
+                if result.status.is_terminal:
+                    return result
+                threading.Event().wait(0.001)
+            raise AssertionError(f"subagent task {task_id} did not finish")
+
+        async def adelegate(prompt: str) -> str:
+            task_id = new_executor().execute_async(prompt)
+            result = await wait_async(task_id)
+            executor_module.cleanup_background_task(task_id)
+            assert result.status.value == classes["SubagentStatus"].COMPLETED.value
+            return result.result or ""
+
+        def delegate(prompt: str) -> str:
+            task_id = new_executor().execute_async(prompt)
+            result = wait_sync(task_id)
+            executor_module.cleanup_background_task(task_id)
+            assert result.status.value == classes["SubagentStatus"].COMPLETED.value
+            return result.result or ""
+
+        task = StructuredTool.from_function(
+            func=delegate,
+            coroutine=adelegate,
+            name="task",
+            description="Delegate one deterministic local subagent task.",
+        )
+        lead_agent = create_agent(model=LeadModel(), tools=[task])
+
+        from deerflow.runtime.runs import worker as worker_module
+
+        monkeypatch.setattr(worker_module, "get_tracing_config", lambda: SimpleNamespace(phoenix=config))
+        phoenix.shutdown_phoenix_tracing()
+        assert not instrumentor._is_instrumented_by_opentelemetry
+        try:
+            phoenix.ensure_phoenix_tracing_initialized(config)
+            assert instrumentor._is_instrumented_by_opentelemetry
+            if entry_mode == "gateway":
+                record = RunRecord(
+                    run_id=f"task4-{entry_mode}-{langsmith_enabled}",
+                    thread_id=f"thread-task4-{entry_mode}-{langsmith_enabled}",
+                    assistant_id="lead-agent",
+                    status=RunStatus.pending,
+                    on_disconnect=DisconnectMode.cancel,
+                )
+                asyncio.run(
+                    run_agent(
+                        _WorkerBridge(),
+                        _WorkerRunManager(),
+                        record,
+                        ctx=RunContext(checkpointer=None),
+                        agent_factory=lambda config: lead_agent,
+                        graph_input={"messages": [HumanMessage(content="delegate once")]},
+                        config={
+                            "callbacks": list(tracing_callbacks),
+                            "configurable": {"thread_id": record.thread_id},
+                        },
+                    )
+                )
+            else:
+                caller_span_ids: list[int] = []
+                with provider.get_tracer("deerflow.tests.task4.embedded").start_as_current_span("embedded-caller") as caller_span:
+                    _invoke_embedded_client(
+                        monkeypatch,
+                        lead_agent,
+                        f"task4-{entry_mode}-{langsmith_enabled}",
+                        langsmith_tracer,
+                        caller_span_ids,
+                    )
+                assert caller_span_ids
+                assert set(caller_span_ids) == {caller_span.get_span_context().span_id}
+            spans = list(exporter.get_finished_spans())
+        finally:
+            phoenix.shutdown_phoenix_tracing()
+            assert not instrumentor._is_instrumented_by_opentelemetry
+            executor_module._shutdown_isolated_subagent_loop()
+
+        task_spans = [span for span in spans if span.name == "task" and span.attributes.get("openinference.span.kind") == "TOOL"]
+        boundary_spans = [span for span in spans if span.attributes.get("deerflow.span.role") == "run_boundary" and span.attributes.get("deerflow.agent_name") == "subagent:general-purpose"]
+        graph_spans = [span for span in spans if span.name == "subagent:general-purpose"]
+        assert len(task_spans) == len(boundary_spans) == len(graph_spans) == task_count, [
+            (
+                span.name,
+                span.attributes.get("openinference.span.kind"),
+                span.attributes.get("deerflow.span.role"),
+                span.attributes.get("deerflow.agent_name"),
+                span.parent.span_id if span.parent is not None else None,
+            )
+            for span in spans
+        ]
+        boundaries_by_task_parent = {boundary.parent.span_id: boundary for boundary in boundary_spans if boundary.parent is not None}
+        graphs_by_boundary_parent = {graph.parent.span_id: graph for graph in graph_spans if graph.parent is not None}
+        assert len(boundaries_by_task_parent) == len(graphs_by_boundary_parent) == task_count
+        for task_span in task_spans:
+            boundary_span = boundaries_by_task_parent[task_span.context.span_id]
+            graph_span = graphs_by_boundary_parent[boundary_span.context.span_id]
+            _assert_task_boundary_graph_topology(
+                spans,
+                task_span=task_span,
+                boundary_span=boundary_span,
+                graph_span=graph_span,
+            )
+
+        spans_by_parent: dict[int, list] = {}
+        for span in spans:
+            if span.parent is not None:
+                spans_by_parent.setdefault(span.parent.span_id, []).append(span)
+
+        descendant_ids = {graph.context.span_id for graph in graph_spans}
+        pending_ids = list(descendant_ids)
+        while pending_ids:
+            parent_id = pending_ids.pop()
+            for child in spans_by_parent.get(parent_id, []):
+                if child.context.span_id not in descendant_ids:
+                    descendant_ids.add(child.context.span_id)
+                    pending_ids.append(child.context.span_id)
+        descendants = [span for span in spans if span.context.span_id in descendant_ids]
+        descendant_names = {span.name for span in descendants}
+        assert {"model", "tools", "SubagentModel", "task4_subagent_echo"} <= descendant_names
+        spans_by_id = {span.context.span_id: span for span in spans}
+        subagent_model_spans = [span for span in descendants if span.name == "SubagentModel"]
+        subagent_tool_spans = [span for span in descendants if span.name == "task4_subagent_echo"]
+        assert subagent_model_spans and subagent_tool_spans
+        assert all(span.parent is not None and spans_by_id[span.parent.span_id].name == "model" for span in subagent_model_spans)
+        assert all(span.parent is not None and spans_by_id[span.parent.span_id].name == "tools" for span in subagent_tool_spans)
+        assert all(task_span.parent is not None and next(span for span in spans if span.context.span_id == task_span.parent.span_id).name == "tools" for task_span in task_spans)
+        assert subagent_tool_calls == ["subagent-result"] * task_count
+        assert len(isolated_thread_ids) == task_count
+        assert len(set(isolated_thread_ids)) == 1
+        assert isolated_thread_ids[0] != threading.get_ident()
+        if langsmith_enabled:
+            assert None not in copied_run_tree_ids
+            assert len(set(copied_run_tree_ids)) == task_count
+        else:
+            assert copied_run_tree_ids == [None] * task_count
+        assert not phoenix._graph_root_parent_overrides
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("outcome", "expected_result_status", "expected_boundary_status"),
+        [
+            ("cancel", "CANCELLED", StatusCode.UNSET),
+            ("timeout", "TIMED_OUT", StatusCode.UNSET),
+            ("error", "FAILED", StatusCode.ERROR),
+        ],
+    )
+    async def test_aexecute_lifecycle_status_and_override_cleanup(
+        self,
+        classes,
+        executor_module,
+        monkeypatch,
+        outcome,
+        expected_result_status,
+        expected_boundary_status,
+    ):
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        from deerflow.config.tracing_config import PhoenixTracingConfig
+        from deerflow.tracing import phoenix
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        instrumentor = LangChainInstrumentor()
+        config = PhoenixTracingConfig(
+            enabled=True,
+            collector_endpoint="http://phoenix.test:6006",
+            api_key=None,
+            project_name=f"deer-flow-subagent-{outcome}-test",
+            auto_instrument=True,
+            capture_content=True,
+            trace_parent_mode="auto",
+            trace_parent_required=False,
+            propagate_baggage=False,
+        )
+        phoenix_module = ModuleType("phoenix")
+        phoenix_module.__path__ = []
+        phoenix_otel_module = ModuleType("phoenix.otel")
+        phoenix_otel_module.register = lambda **_kwargs: provider
+        phoenix_module.otel = phoenix_otel_module
+        monkeypatch.setitem(sys.modules, "phoenix", phoenix_module)
+        monkeypatch.setitem(sys.modules, "phoenix.otel", phoenix_otel_module)
+        monkeypatch.setattr(phoenix, "get_tracing_config", lambda: SimpleNamespace(phoenix=config))
+        monkeypatch.setattr(trace, "get_tracer", provider.get_tracer)
+        phoenix.shutdown_phoenix_tracing()
+        assert not instrumentor._is_instrumented_by_opentelemetry
+        try:
+            phoenix.ensure_phoenix_tracing_initialized(config)
+            assert instrumentor._is_instrumented_by_opentelemetry
+            tracer = instrumentor._tracer
+            assert tracer is not None
+
+            cancel_event = threading.Event()
+
+            class _LifecycleGraphAgent:
+                async def astream(self, _state, *, config, context, stream_mode):  # noqa: ARG002 - signature parity
+                    run_id = config["run_id"]
+                    tracer.on_chain_start(
+                        {"name": config["run_name"]},
+                        {"input": "graph"},
+                        run_id=run_id,
+                        name=config["run_name"],
+                    )
+                    try:
+                        if outcome == "cancel":
+                            yield {"messages": []}
+                            cancel_event.set()
+                            yield {"messages": []}
+                        elif outcome == "timeout":
+                            await asyncio.Event().wait()
+                            yield  # pragma: no cover - cancellation exits first
+                        else:
+                            raise RuntimeError("subagent graph failed")
+                    except Exception as exc:
+                        tracer.on_chain_error(exc, run_id=run_id)
+                        raise
+                    finally:
+                        if outcome in {"cancel", "timeout"}:
+                            tracer.on_chain_end({"output": "graph"}, run_id=run_id)
+
+            async def initial_state(_task):
+                return ({"messages": []}, [], None)
+
+            monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: [])
+            executor = self._make_executor(classes, user_id="alice", name="general-purpose")
+            monkeypatch.setattr(executor, "_build_initial_state", initial_state)
+            monkeypatch.setattr(executor, "_create_agent", lambda *args, **kwargs: _LifecycleGraphAgent())
+            if outcome == "timeout":
+                executor.config.timeout_seconds = 0.05
+                task_id = executor.execute_async("do something")
+                deadline = asyncio.get_running_loop().time() + 5
+                while True:
+                    result = executor_module.get_background_task_result(task_id)
+                    assert result is not None
+                    boundary_spans = [span for span in exporter.get_finished_spans() if span.attributes.get("deerflow.span.role") == "run_boundary"]
+                    if result.status.is_terminal and boundary_spans:
+                        break
+                    assert asyncio.get_running_loop().time() < deadline, "timed-out subagent boundary did not finish"
+                    await asyncio.sleep(0.001)
+                executor_module.cleanup_background_task(task_id)
+            else:
+                result_holder = classes["SubagentResult"](
+                    task_id=f"{outcome}-mid",
+                    trace_id="test-trace",
+                    status=classes["SubagentStatus"].RUNNING,
+                    started_at=datetime.now(),
+                    cancel_event=cancel_event,
+                )
+                result = await executor._aexecute("do something", result_holder=result_holder)
+            spans = exporter.get_finished_spans()
+        finally:
+            phoenix.shutdown_phoenix_tracing()
+            assert not instrumentor._is_instrumented_by_opentelemetry
+            executor_module._shutdown_isolated_subagent_loop()
+
+        assert result.status.value == getattr(classes["SubagentStatus"], expected_result_status).value
+        boundary_spans = [span for span in spans if span.attributes.get("deerflow.span.role") == "run_boundary"]
+        assert len(boundary_spans) == 1
+        boundary = boundary_spans[0]
+        assert boundary.name == "deerflow.run"
+        assert boundary.status.status_code == expected_boundary_status
+        assert not phoenix._graph_root_parent_overrides
+
+    @pytest.mark.anyio
+    async def test_aexecute_uses_explicit_parent_trace_context_when_supplied(
+        self,
+        classes,
+        executor_module,
+        monkeypatch,
+    ):
+        from deerflow.tracing import TraceContextCarrier
+
+        monkeypatch.setenv("PHOENIX_TRACING", "true")
+        monkeypatch.setenv("PHOENIX_PROJECT_NAME", "deer-flow-tests")
+        monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.test:6006")
+        from deerflow.config.tracing_config import reset_tracing_config
+
+        reset_tracing_config()
+        monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: [])
+
+        carrier = TraceContextCarrier(
+            traceparent="00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            tracestate="vendor=value",
+            baggage="user.id=alice",
+        )
+
+        recorded_roots = []
+        with self._recorded_root_context(recorded_roots) as fake_activate:
+            monkeypatch.setattr(executor_module, "activate_phoenix_root_context", fake_activate)
+
+            executor = self._make_executor(classes, user_id="alice")
+            executor.otel_trace_context = carrier
+            fake_agent = _FakeStreamAgent()
+            monkeypatch.setattr(executor, "_build_initial_state", self._noop_build_initial_state)
+            monkeypatch.setattr(executor, "_create_agent", lambda *a, **kw: fake_agent)
+
+            await executor._aexecute("do something")
+
+        assert len(recorded_roots) == 1
+        assert recorded_roots[0].upstream_context == carrier
 
     @pytest.mark.anyio
     async def test_aexecute_injects_langfuse_session_user_and_trace_name(
@@ -2171,6 +2930,68 @@ class TestSubagentTracingWiring:
         # DEFAULT_USER_ID is "default" (see deerflow.runtime.user_context).
         assert metadata.get("langfuse_user_id") == "default"
 
+    def test_execute_async_captures_parent_context_for_isolated_loop(self, executor_module, classes, base_config):
+        from deerflow.config.tracing_config import reset_tracing_config
+        from deerflow.tracing import TraceContextCarrier
+
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentStatus = classes["SubagentStatus"]
+
+        captured_contexts: list = []
+        recorded_roots: list = []
+        reset_tracing_config()
+        carrier = TraceContextCarrier(
+            traceparent="00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+            tracestate="vendor=value",
+        )
+
+        class InlineFuture:
+            def result(self, timeout=None):  # noqa: ARG002 - signature parity
+                return None
+
+            def cancel(self):
+                return False
+
+        def fake_submit(parent_context, coro_factory):
+            captured_contexts.append(parent_context)
+            coro = parent_context.run(coro_factory)
+            asyncio.run(coro)
+            return InlineFuture()
+
+        def run_inline(fn):
+            fn()
+
+            class _Done:
+                def result(self):
+                    return None
+
+            return _Done()
+
+        executor = SubagentExecutor(
+            config=base_config,
+            tools=[],
+            thread_id="test-thread",
+            trace_id="test-trace",
+            user_id="alice",
+            otel_trace_context=carrier,
+        )
+        fake_agent = _FakeStreamAgent()
+        with patch.object(executor, "_build_initial_state", self._noop_build_initial_state), patch.object(executor, "_create_agent", lambda *a, **kw: fake_agent), patch.object(executor_module, "build_tracing_callbacks", lambda: []):
+            with self._recorded_root_context(recorded_roots) as fake_activate:
+                with (
+                    patch.object(executor_module, "_submit_to_isolated_loop_in_context", side_effect=fake_submit),
+                    patch.object(executor_module._scheduler_pool, "submit", side_effect=run_inline),
+                    patch.object(executor_module, "activate_phoenix_root_context", fake_activate),
+                ):
+                    task_id = executor.execute_async("Task")
+
+        result = executor_module._background_tasks.get(task_id)
+        assert result is not None
+        assert result.status.value == SubagentStatus.COMPLETED.value
+        assert captured_contexts, "execute_async must still copy and submit parent ContextVars"
+        assert len(recorded_roots) == 1, "_aexecute must activate a Phoenix root on the isolated loop path"
+        assert recorded_roots[0].upstream_context == carrier
+
     @pytest.mark.anyio
     async def test_trace_name_falls_back_when_config_name_empty(
         self,
@@ -2250,3 +3071,200 @@ class TestSubagentTracingWiring:
         from langchain_core.messages import HumanMessage
 
         return ({"messages": [HumanMessage(content=task)]}, [], None)
+
+    def test_real_graph_terminal_parents_on_production_persistent_isolated_loop(
+        self,
+        executor_module,
+        monkeypatch,
+    ):
+        from langchain.agents import create_agent
+        from langchain.agents.middleware import AgentMiddleware
+        from langchain_core.callbacks import CallbackManager
+        from langchain_core.language_models import BaseChatModel
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        from langchain_core.tools import tool
+        from langchain_core.tracers.langchain import LangChainTracer
+        from langsmith import Client
+        from langsmith.run_helpers import get_current_run_tree, set_tracing_parent
+        from langsmith.run_trees import RunTree
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        from deerflow.tracing import phoenix
+
+        class LocalModel(BaseChatModel):
+            call_count: int = 0
+
+            @property
+            def _llm_type(self) -> str:
+                return "isolated-parent-compat-local"
+
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                self.call_count += 1
+                if self.call_count == 1:
+                    message = AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "isolated-parent-compat-call",
+                                "name": "isolated_parent_compat_echo",
+                                "args": {"value": "isolated-result"},
+                            }
+                        ],
+                    )
+                else:
+                    message = AIMessage(content="isolated done")
+                return ChatResult(generations=[ChatGeneration(message=message)])
+
+            async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+                return self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+        class ExternalWrapperMiddleware(AgentMiddleware):
+            def wrap_model_call(self, request, handler):
+                return handler(request)
+
+            def wrap_tool_call(self, request, handler):
+                return handler(request)
+
+        tool_calls: list[str] = []
+
+        @tool
+        def isolated_parent_compat_echo(value: str) -> str:
+            """Return a deterministic local value on the isolated graph path."""
+            tool_calls.append(value)
+            return value
+
+        monkeypatch.setenv("LANGSMITH_TRACING", "false")
+        monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+        monkeypatch.setenv("LANGCHAIN_TRACING", "false")
+        monkeypatch.setattr(RunTree, "post", lambda self, *args, **kwargs: None)
+        monkeypatch.setattr(RunTree, "patch", lambda self, *args, **kwargs: None)
+        monkeypatch.setattr(Client, "create_run", lambda self, *args, **kwargs: None)
+        monkeypatch.setattr(Client, "update_run", lambda self, *args, **kwargs: None)
+
+        real_new_event_loop = executor_module.asyncio.new_event_loop
+        wake_controls: list[tuple[asyncio.AbstractEventLoop, threading.Event, list[asyncio.TimerHandle]]] = []
+
+        def new_event_loop_with_finite_selector_wait() -> asyncio.AbstractEventLoop:
+            loop = real_new_event_loop()
+            stop_wake = threading.Event()
+            timer_handles: list[asyncio.TimerHandle] = []
+
+            def wake_tick() -> None:
+                if stop_wake.is_set():
+                    return
+                timer_handles.append(loop.call_later(0.01, wake_tick))
+
+            loop.call_soon(wake_tick)
+            wake_controls.append((loop, stop_wake, timer_handles))
+            return loop
+
+        executor_module._shutdown_isolated_subagent_loop()
+        monkeypatch.setattr(executor_module.asyncio, "new_event_loop", new_event_loop_with_finite_selector_wait)
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        instrumentor = LangChainInstrumentor()
+        assert not instrumentor._is_instrumented_by_opentelemetry
+        instrumentor.instrument(tracer_provider=provider)
+        tracer = instrumentor._tracer
+        assert tracer is not None
+        phoenix.reset_phoenix_tracing_for_tests()
+        phoenix._install_openinference_langchain_parent_compat(provider)
+
+        langsmith_client = Client(
+            api_url="http://langsmith.invalid",
+            api_key="test-key",
+            auto_batch_tracing=False,
+        )
+        langsmith_tracer = LangChainTracer(
+            project_name="parent-compat-isolated",
+            client=langsmith_client,
+        )
+        outer_tree = RunTree(name="isolated-outer", inputs={}, client=langsmith_client)
+        nearest_tree = outer_tree.create_child("isolated-nearest")
+        external_tree = nearest_tree.create_child("isolated-external")
+        callback_manager = CallbackManager.configure(inheritable_callbacks=[tracer])
+        outer_manager = callback_manager.on_chain_start(
+            {"name": outer_tree.name},
+            {},
+            run_id=outer_tree.id,
+            name=outer_tree.name,
+        )
+        nearest_manager = outer_manager.get_child().on_chain_start(
+            {"name": nearest_tree.name},
+            {},
+            run_id=nearest_tree.id,
+            name=nearest_tree.name,
+        )
+        agent = create_agent(
+            model=LocalModel(),
+            tools=[isolated_parent_compat_echo],
+            middleware=[ExternalWrapperMiddleware()],
+        )
+        execution_thread_ids: list[int] = []
+        execution_run_tree_ids: list = []
+        execution_otel_span_ids: list[int] = []
+        caller_thread_id = threading.get_ident()
+
+        async def run_graph_on_isolated_loop() -> None:
+            from opentelemetry import trace
+
+            execution_thread_ids.append(threading.get_ident())
+            current_run_tree = get_current_run_tree()
+            execution_run_tree_ids.append(current_run_tree.id if current_run_tree is not None else None)
+            execution_otel_span_ids.append(trace.get_current_span().get_span_context().span_id)
+            agent.invoke(
+                {"messages": [HumanMessage(content="run isolated graph")]},
+                config={
+                    "run_name": "actual-isolated-subagent-graph",
+                    "callbacks": [langsmith_tracer],
+                },
+            )
+
+        try:
+            production_loop = executor_module._get_isolated_subagent_loop()
+            assert wake_controls and wake_controls[0][0] is production_loop
+            with provider.get_tracer("deerflow.tests.isolated-manual").start_as_current_span("isolated-manual-root") as manual_root:
+                with set_tracing_parent(external_tree):
+                    parent_context = copy_context()
+                    future = executor_module._submit_to_isolated_loop_in_context(
+                        parent_context,
+                        lambda: run_graph_on_isolated_loop(),
+                    )
+                    future.result(timeout=10)
+        finally:
+            nearest_manager.on_chain_end({"output": "done"})
+            outer_manager.on_chain_end({"output": "done"})
+            phoenix.reset_phoenix_tracing_for_tests()
+            instrumentor.uninstrument()
+            provider.shutdown()
+            for loop, stop_wake, timer_handles in wake_controls:
+                stop_wake.set()
+                loop.call_soon_threadsafe(lambda handles=timer_handles: [handle.cancel() for handle in handles])
+            executor_module._shutdown_isolated_subagent_loop()
+
+        spans = exporter.get_finished_spans()
+        spans_by_id = {span.context.span_id: span for span in spans}
+        assert execution_thread_ids and execution_thread_ids[0] != caller_thread_id
+        assert execution_run_tree_ids == [external_tree.id]
+        assert execution_otel_span_ids == [manual_root.get_span_context().span_id]
+        terminal_spans = [span for span in spans if span.attributes.get("openinference.span.kind") in {"LLM", "TOOL"}]
+        assert {span.attributes["openinference.span.kind"] for span in terminal_spans} == {
+            "LLM",
+            "TOOL",
+        }
+        for terminal_span in terminal_spans:
+            assert terminal_span.parent is not None
+            parent_span = spans_by_id[terminal_span.parent.span_id]
+            expected_parent_name = "model" if terminal_span.attributes["openinference.span.kind"] == "LLM" else "tools"
+            assert parent_span.name == expected_parent_name
+            assert parent_span.context.span_id != manual_root.get_span_context().span_id
+        assert tool_calls == ["isolated-result"]

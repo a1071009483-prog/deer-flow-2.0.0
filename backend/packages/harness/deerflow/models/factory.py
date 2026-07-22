@@ -86,17 +86,20 @@ def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *
         name: The name of the model to create. If None, the first model in the config will be used.
         thinking_enabled: Enable the model's extended-thinking mode when supported.
         app_config: Explicit application config; falls back to the cached global if omitted.
-        attach_tracing: When True (default), attach tracing callbacks (Langfuse,
-            LangSmith) directly to the model instance. Standalone callers — anything
-            that invokes the model outside a LangGraph run that already wires tracing
-            at the invocation root (``MemoryUpdater``, ad-hoc utilities, etc.) — keep
-            this default so the model-level callback still produces traces. Callers
-            that already attach tracing at the graph root (``make_lead_agent``, the
-            in-graph ``TitleMiddleware``) MUST pass ``attach_tracing=False``; otherwise
-            the same LLM call emits duplicate spans (one rooted at the graph, one at
-            the model) and ``session_id`` / ``user_id`` metadata never reach the trace
-            because the model becomes a nested observation whose ``langfuse_*`` keys
-            get stripped.
+        attach_tracing: When True (default), attach external tracing callbacks
+            (LangSmith, Langfuse) directly to the model instance and allow the
+            tracing factory to perform Phoenix/OpenTelemetry initialization as a
+            side effect. Phoenix itself does not attach as a model-level callback.
+            Standalone callers — anything that invokes the model outside a
+            LangGraph run that already wires tracing at the invocation root
+            (``MemoryUpdater``, ad-hoc utilities, etc.) — keep this default so the
+            model-level callbacks still produce traces. Callers that already attach
+            tracing at the graph root (``make_lead_agent``, the in-graph
+            ``TitleMiddleware``) MUST pass ``attach_tracing=False``; otherwise the
+            same LLM call emits duplicate spans (one rooted at the graph, one at
+            the model) and ``session_id`` / ``user_id`` metadata never reach the
+            trace because the model becomes a nested observation whose
+            ``langfuse_*`` keys get stripped.
 
     Returns:
         A chat model instance.

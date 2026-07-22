@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -48,6 +49,37 @@ logger = logging.getLogger(__name__)
 # Bounds worker exit time so uvicorn's reload supervisor does not keep
 # firing signals into a worker that is stuck waiting for shutdown cleanup.
 _SHUTDOWN_HOOK_TIMEOUT_SECONDS = 5.0
+
+
+async def _shutdown_phoenix_tracing_bounded() -> None:
+    """Run potentially blocking exporter cleanup without delaying gateway exit."""
+    from deerflow.tracing import shutdown_phoenix_tracing
+
+    completed = threading.Event()
+    failure: list[BaseException] = []
+
+    def cleanup() -> None:
+        try:
+            shutdown_phoenix_tracing(timeout_millis=int(_SHUTDOWN_HOOK_TIMEOUT_SECONDS * 1000))
+        except BaseException as exc:  # pragma: no cover - SDK boundary; logged by the caller task
+            failure.append(exc)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=cleanup, name="phoenix-tracing-shutdown", daemon=True)
+    thread.start()
+    deadline = asyncio.get_running_loop().time() + _SHUTDOWN_HOOK_TIMEOUT_SECONDS
+    while not completed.is_set():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            logger.warning(
+                "Phoenix tracing shutdown exceeded %.1fs; daemon cleanup will not delay worker exit.",
+                _SHUTDOWN_HOOK_TIMEOUT_SECONDS,
+            )
+            return
+        await asyncio.sleep(min(remaining, 0.05))
+    if failure:
+        logger.exception("Phoenix tracing shutdown failed", exc_info=failure[0])
 
 
 async def _ensure_admin_user(app: FastAPI) -> None:
@@ -208,41 +240,43 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.warning("tiktoken warm-up skipped", exc_info=True)
 
     # Initialize LangGraph runtime components (StreamBridge, RunManager, checkpointer, store)
-    async with langgraph_runtime(app, startup_config):
-        logger.info("LangGraph runtime initialised")
+    try:
+        async with langgraph_runtime(app, startup_config):
+            logger.info("LangGraph runtime initialised")
 
-        # Check admin bootstrap state and migrate orphan threads after admin exists.
-        # Must run AFTER langgraph_runtime so app.state.store is available for thread migration
-        await _ensure_admin_user(app)
+            # Check admin bootstrap state and migrate orphan threads after admin exists.
+            # Must run AFTER langgraph_runtime so app.state.store is available for thread migration
+            await _ensure_admin_user(app)
 
-        # Start IM channel service if any channels are configured
-        try:
-            from app.channels.service import start_channel_service
+            # Start IM channel service if any channels are configured
+            try:
+                from app.channels.service import start_channel_service
 
-            channel_service = await start_channel_service(startup_config)
-            logger.info("Channel service started: %s", channel_service.get_status())
-        except Exception:
-            logger.exception("No IM channels configured or channel service failed to start")
+                channel_service = await start_channel_service(startup_config)
+                logger.info("Channel service started: %s", channel_service.get_status())
+            except Exception:
+                logger.exception("No IM channels configured or channel service failed to start")
 
-        yield
+            yield
 
-        # Stop channel service on shutdown (bounded to prevent worker hang)
-        try:
-            from app.channels.service import stop_channel_service
+            # Stop channel service on shutdown (bounded to prevent worker hang)
+            try:
+                from app.channels.service import stop_channel_service
 
-            await asyncio.wait_for(
-                stop_channel_service(),
-                timeout=_SHUTDOWN_HOOK_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
-            logger.warning(
-                "Channel service shutdown exceeded %.1fs; proceeding with worker exit.",
-                _SHUTDOWN_HOOK_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            logger.exception("Failed to stop channel service")
-
-    logger.info("Shutting down API Gateway")
+                await asyncio.wait_for(
+                    stop_channel_service(),
+                    timeout=_SHUTDOWN_HOOK_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Channel service shutdown exceeded %.1fs; proceeding with worker exit.",
+                    _SHUTDOWN_HOOK_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.exception("Failed to stop channel service")
+    finally:
+        await _shutdown_phoenix_tracing_bounded()
+        logger.info("Shutting down API Gateway")
 
 
 def create_app() -> FastAPI:

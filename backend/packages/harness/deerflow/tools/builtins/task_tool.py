@@ -11,6 +11,7 @@ from langchain_core.callbacks import BaseCallbackManager
 from langgraph.config import get_stream_writer
 
 from deerflow.config import get_app_config
+from deerflow.config.tracing_config import get_tracing_config
 from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.sandbox.security import LOCAL_BASH_SUBAGENT_DISABLED_MESSAGE, is_host_bash_allowed
 from deerflow.subagents import SubagentExecutor, get_available_subagent_names, get_subagent_config
@@ -22,6 +23,10 @@ from deerflow.subagents.executor import (
     request_cancel_background_task,
 )
 from deerflow.tools.types import Runtime
+from deerflow.tracing import (
+    capture_current_phoenix_trace_context,
+    capture_current_trace_context,
+)
 
 if TYPE_CHECKING:
     from deerflow.config.app_config import AppConfig
@@ -302,6 +307,9 @@ async def task_tool(
         available_tools_kwargs["app_config"] = resolved_app_config
     tools = get_available_tools(**available_tools_kwargs)
 
+    phoenix_config = get_tracing_config().phoenix
+    otel_trace_context = capture_current_phoenix_trace_context(include_baggage=phoenix_config.propagate_baggage) if phoenix_config.enabled else capture_current_trace_context(include_baggage=phoenix_config.propagate_baggage)
+
     # Create executor
     executor_kwargs = {
         "config": config,
@@ -311,6 +319,7 @@ async def task_tool(
         "thread_data": thread_data,
         "thread_id": thread_id,
         "trace_id": trace_id,
+        "otel_trace_context": otel_trace_context,
         "user_id": user_id,
     }
     if resolved_app_config is not None:

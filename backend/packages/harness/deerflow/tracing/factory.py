@@ -7,6 +7,7 @@ from deerflow.config import (
     get_tracing_config,
     validate_enabled_tracing_providers,
 )
+from deerflow.tracing.phoenix import ensure_phoenix_tracing_initialized
 
 
 def _create_langsmith_tracer(config) -> Any:
@@ -50,5 +51,7 @@ def build_tracing_callbacks() -> list[Any]:
                 callbacks.append(_create_langfuse_handler(tracing_config.langfuse))
             except Exception as exc:  # pragma: no cover - exercised via tests with monkeypatch
                 raise RuntimeError(f"Langfuse tracing initialization failed: {exc}") from exc
+        elif provider == "phoenix":
+            ensure_phoenix_tracing_initialized(tracing_config.phoenix)
 
     return callbacks

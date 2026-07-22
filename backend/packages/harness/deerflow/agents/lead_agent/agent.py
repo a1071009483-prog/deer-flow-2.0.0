@@ -3,12 +3,13 @@
 INVARIANT — tracing callback placement
 ======================================
 
-Tracing callbacks (Langfuse, LangSmith) are attached at the **graph
-invocation root** in :func:`_make_lead_agent` (see the
+External tracing callbacks (LangSmith, Langfuse) are attached at the
+**graph invocation root** in :func:`_make_lead_agent` (see the
 ``build_tracing_callbacks()`` block that appends to ``config["callbacks"]``).
 Every ``create_chat_model(...)`` call inside this module — and inside any
 middleware reachable from this graph (e.g. ``TitleMiddleware``) — MUST pass
-``attach_tracing=False``.
+``attach_tracing=False`` so Phoenix initialization stays outside the model
+callback list.
 
 Forgetting that flag emits duplicate spans (one rooted at the graph, one at
 the model) AND prevents the Langfuse handler's ``propagate_attributes``

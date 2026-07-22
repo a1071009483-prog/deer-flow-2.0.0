@@ -58,6 +58,7 @@ DeerFlow has newly integrated the intelligent search and crawling toolset indepe
       - [IM Channels](#im-channels)
       - [LangSmith Tracing](#langsmith-tracing)
       - [Langfuse Tracing](#langfuse-tracing)
+      - [Phoenix Tracing](#phoenix-tracing)
       - [Using Both Providers](#using-both-providers)
   - [From Deep Research to Super Agent Harness](#from-deep-research-to-super-agent-harness)
   - [Core Features](#core-features)
@@ -555,6 +556,73 @@ If you are using a self-hosted Langfuse instance, set `LANGFUSE_BASE_URL` to you
 - `tags` = `[env:<DEER_FLOW_ENV>, model:<model_name>]` (omitted when not set)
 
 These are injected into `RunnableConfig.metadata` at the graph invocation root for both the gateway path (`runtime/runs/worker.py::run_agent`) and the embedded path (`client.py::DeerFlowClient.stream`), so any LangChain-compatible callback can read them. Set `DEER_FLOW_ENV` (or `ENVIRONMENT`) to tag traces by deployment environment.
+
+#### Phoenix Tracing
+
+Phoenix is external tracing only. RunJournal/EventStore remains the internal source of truth for run history and token usage. LangSmith/Langfuse callbacks remain supported. Phoenix uses OpenTelemetry/OpenInference initialization plus a DeerFlow graph-root span around each graph invocation, and it is not attached as a callback provider at model creation inside graph runs.
+
+Add the following to your `.env` file:
+
+```bash
+PHOENIX_TRACING=true
+PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006
+PHOENIX_PROJECT_NAME=deer-flow
+PHOENIX_AUTO_INSTRUMENT=true
+PHOENIX_CAPTURE_CONTENT=false
+PHOENIX_METADATA_ALLOWLIST=request_id,tenant_id
+PHOENIX_TRACE_PARENT_MODE=auto
+PHOENIX_TRACE_PARENT_REQUIRED=false
+PHOENIX_PROPAGATE_BAGGAGE=false
+```
+
+For local Phoenix, `http://localhost:6006` is accepted and DeerFlow normalizes it to `/v1/traces`. For cloud or remote Phoenix, or any authenticated collector, set `PHOENIX_COLLECTOR_ENDPOINT` to that service's OTLP traces endpoint or accepted base URL and set `PHOENIX_API_KEY` when the collector requires auth.
+
+Phoenix support in the backend comes from the harness dependencies already installed from this repo, including `arize-phoenix-otel` and `openinference-instrumentation-langchain`. The parent-compatibility layer relies on a qualified private API set, so the harness exactly pins `langchain==1.2.15`, `langchain-core==1.3.3`, `langsmith==0.8.18`, and `openinference-instrumentation-langchain==0.1.67`. Requalify tracing before upgrading any of these packages.
+
+DeerFlow owns an isolated Phoenix `TracerProvider`; it never replaces a host application's global OTel provider or copies Phoenix processors into it. Phoenix registration creates a batch provider with `set_global_tracer_provider=false`, then DeerFlow explicitly binds every discovered OpenInference instrumentor and the manual `deerflow.run` boundary to that same provider. A pre-existing instrumentor is treated as foreign ownership and initialization fails without changing it. Partial initialization is rolled back before retry. Batch queue, schedule, export timeout, and batch size use the standard `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_EXPORT_TIMEOUT`, and `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` variables.
+
+Gateway shutdown drains active runs before flushing Phoenix. SDK cleanup runs on a daemon thread under the gateway's five-second shutdown deadline, calls `force_flush` before `shutdown`, and relinquishes the provider's SDK `atexit` hook before potentially blocking exporter work. A single graph or embedded stream never shuts down the process-level provider.
+
+When LangSmith `traceable` middleware supplies an external RunTree parent that OpenInference has not registered, DeerFlow's Phoenix-owned tracer resolves the nearest registered business ancestor. This keeps terminal LLM, tool, chain, and retriever spans under nodes such as `model` and `tools` instead of falling back to the manual DeerFlow root. This default repair does not export the complete `awrap_model_call` / `awrap_tool_call` middleware wrapper tree; that tree is owned by the independent, default-off `add-phoenix-middleware-diagnostics` OpenSpec change and is not part of the base tracing provider. Restart every DeerFlow backend process after deploying or upgrading this tracing code. Historical Phoenix traces are not rewritten.
+
+Phoenix intentionally shows two distinct top-level execution layers: the DeerFlow/upstream run boundary is named `deerflow.run`, while the OpenInference auto-instrumented child keeps the real graph name such as `lead_agent` or `subagent:general-purpose`. The boundary remains an OpenInference `agent` span and exposes `deerflow.span.role=run_boundary`, `deerflow.agent_name`, and `deerflow.root_run_name` for filtering and aggregation. A normal trace therefore starts as `deerflow.run -> lead_agent`, not two same-name `lead_agent` spans. This preserves upstream parent-mode and session/user behavior without mixing boundary latency/counts with graph invocation metrics.
+
+When `PHOENIX_CAPTURE_CONTENT=false`, DeerFlow rebuilds metadata for both the Phoenix root context and the OpenInference LangChain auto-instrumentor. `PHOENIX_METADATA_ALLOWLIST` is empty by default; it accepts comma-separated, exact top-level caller metadata keys, trimming whitespace and de-duplicating keys in order. The example exports only `request_id` and `tenant_id`; all other caller metadata and all caller tags remain excluded. Provider-reserved allowlist entries, including `langfuse_*`, are ignored by the manual Phoenix root; DeerFlow-generated reserved keys remain available only to the auto-instrumentor path that needs them. DeerFlow's session/thread, user, assistant/subagent, model, environment, root run name, run id, and controlled tags take precedence over caller values. Allowlisted values must be generated or validated by a trusted gateway or RBAC layer. When `PHOENIX_CAPTURE_CONTENT=true`, full invocation metadata and tags can be exported; only enable it for trusted workloads.
+
+To export another business correlation field while content capture remains disabled, append its exact root metadata key and restart every DeerFlow backend process because tracing configuration is cached per process:
+
+```bash
+PHOENIX_CAPTURE_CONTENT=false
+PHOENIX_METADATA_ALLOWLIST=request_id,tenant_id,workspace_id
+```
+
+The field must be present at the top level of the run's `metadata` object, for example:
+
+```json
+{
+  "metadata": {
+    "request_id": "req-20260714-001",
+    "tenant_id": "tenant-acme",
+    "workspace_id": "workspace-research"
+  }
+}
+```
+
+Nested paths are not supported, and adding a key does not make its value trusted or redact it. DeerFlow does not generate `request_id`, `tenant_id`, or custom business fields automatically; a trusted gateway/RBAC layer must inject or validate them. The allowlist applies only to metadata, not tags. With `PHOENIX_CAPTURE_CONTENT=true`, the allowlist is not a privacy boundary because full invocation metadata and tags may be exported.
+
+Phoenix supports these parent modes for upstream OTel context:
+
+| Mode | Behavior |
+|---|---|
+| `root` | Ignore any upstream parent and start a new DeerFlow trace root |
+| `auto` | Use a valid upstream `traceparent` when present; otherwise start a new root |
+| `child` | Require a valid upstream parent; missing or invalid parent fails fast or falls back based on `PHOENIX_TRACE_PARENT_REQUIRED` |
+
+Accepted incoming context fields: `traceparent`, `tracestate`, `baggage`.
+
+DeerFlow validates `traceparent` with the W3C propagator and accepts valid unsampled parents. Missing and supplied-but-invalid parents are reported separately as `missing_parent` and `invalid_parent`. Every new-root branch uses an explicit OTel context without an active span, so `root` mode and `auto`/non-strict `child` fallbacks do not inherit an ambient gateway, worker, or caller span. When baggage propagation is enabled, only baggage parsed from the supplied carrier is retained. The caller's prior OTel context is restored after normal completion or an exception.
+
+When DeerFlow sits behind a gateway, RBAC layer, or custom gateway, extract those fields at ingress, store them in the run config/context/payload, and restore them before graph execution. The embedded Python client accepts the same upstream carrier through its `trace_context` parameter.
 
 #### Using Both Providers
 
