@@ -85,6 +85,12 @@ Async task delegation with concurrent execution:
 - **Execution**: Background thread pools with status tracking and SSE events
 - **Flow**: Agent calls `task()` tool → executor runs subagent in background → polls for completion → returns result
 
+Delegation authorization is bound when each agent is built. Every agent gets a distinct `task` tool closure carrying an immutable parent policy; there is no process-global unrestricted task tool, and `RunnableConfig.metadata` is not an authorization source. A single fail-closed resolver validates the parent policy and child request, resolves the exact tool/skill set, and passes that immutable decision to `SubagentExecutor`. `None` means unrestricted while an empty collection means deny all. Unknown names and incomplete configured/MCP/ACP/skill discovery deny delegation before execution.
+
+Agent caches use separate SHA-256 fingerprints for the normalized parent policy, the resolved delegation decision, and the actual tool/skill catalog. Tool schemas, configured groups, deferred-tool mode, AppConfig/MCP generations, skill content digests, and skill `allowed_tools` therefore invalidate retained tool sets without placing raw skill content, config secrets, paths, or object representations in cache keys.
+
+These rules are invariant across gateway, embedded, direct, and Studio entry paths and across Phoenix content modes. Phoenix safe-mode metadata reconstruction can no longer remove or expand delegation policy. Keep the production `PHOENIX_TRACING=false` mitigation until this complete security PR is deployed and the tracing-on/off authorization smoke passes; the delegation fix must remain deployed if later tracing work is rolled back.
+
 ### Memory System
 
 LLM-powered persistent context retention across conversations:

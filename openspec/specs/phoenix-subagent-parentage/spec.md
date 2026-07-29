@@ -110,3 +110,16 @@ The implementation SHALL verify exact subagent parent IDs across supported entry
 #### Scenario: No empty root-level subagent boundary
 - **WHEN** a successfully traced subagent graph and descendants are exported
 - **THEN** there SHALL be no paired root-level `deerflow.run` subagent boundary with zero children
+
+### Requirement: Parentage handoff preserves delegation decisions
+Tracing parentage handoff SHALL carry only tracing context. It MUST NOT carry, reconstruct, remove, or override subagent authorization policy.
+
+#### Scenario: Cross-thread handoff with restricted parent
+- **WHEN** a restricted parent delegates through the task span into the isolated subagent loop
+- **THEN** the executor SHALL consume the same immutable `ResolvedDelegation` produced before tracing handoff
+- **AND** exact, ambient, fallback, missing-parent, and Phoenix-disabled modes SHALL expose identical effective tools and skills
+
+#### Scenario: Catalog changes while parent policy is unchanged
+- **WHEN** configured, MCP, ACP, deferred-tool, or skill catalog state changes without changing the normalized parent policy
+- **THEN** the tool catalog fingerprint SHALL change and any retained affected tool set SHALL rebuild
+- **AND** the parent policy fingerprint SHALL remain stable

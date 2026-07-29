@@ -318,9 +318,18 @@ Proxied through nginx: `/api/langgraph/*` → Gateway LangGraph-compatible runti
 **Deferred MCP tools** (if `tool_search.enabled`): `SubagentExecutor._build_initial_state` assembles deferral after policy filtering via the shared `assemble_deferred_tools` (fail-closed), appends the `tool_search` tool, injects the `<available-deferred-tools>` section into the subagent's `SystemMessage`, and threads the setup to `_create_agent`, which attaches `DeferredToolFilterMiddleware` through `build_subagent_runtime_middlewares(deferred_setup=...)`. Subagents thus withhold full MCP schemas until promotion, same as the lead agent; each task run gets a fresh `ThreadState` so promotion is isolated per run
 **Checkpointer isolation**: Subagent graphs are compiled with `checkpointer=False` to avoid inheriting the parent run's checkpointer, since subagents are one-shot and never resume.
 
+**Delegation authorization boundary**:
+
+- `DelegationPolicy` is immutable and captured by `build_task_tool()` for each agent. Never restore a module-global `task_tool` or an unrestricted fallback when `subagent_enabled=True`.
+- `resolve_delegation()` is the only component that interprets parent/child allowlists. `None` means unrestricted; an empty tuple/frozenset means deny all. The resolver loads one strict catalog snapshot, rejects unknown or incomplete state, applies configured groups, child allow/deny, and skill `allowed_tools`, then returns `ResolvedDelegation`.
+- `SubagentExecutor` consumes `ResolvedDelegation` directly. It must not reconstruct authorization from `SubagentConfig`, runtime context, or `RunnableConfig.metadata`.
+- `tool_groups` and `available_skills` are business policy and must never be written to or read from tracing metadata. Phoenix enablement and content-capture settings must not change the resolved tools or skills.
+- Retained parent tool sets use `parent_policy_fingerprint` plus `tool_catalog_fingerprint`; resolved child decisions also expose `delegation_decision_fingerprint`. Catalog hashes cover source-qualified schemas, configured groups, deferred mode, monotonic AppConfig/MCP revisions, skill content digests, and normalized `allowed_tools`. Fingerprints are cache/audit keys, not object-integrity proofs.
+- Cache code must require `ParentToolSet`/`ResolvedDelegation`; do not accept an unversioned list fallback. Reordered equivalent policy input must reuse the cache, while any effective catalog or skill-definition change must rebuild it.
+
 ### Tool System (`packages/harness/deerflow/tools/`)
 
-`get_available_tools(groups, include_mcp, model_name, subagent_enabled)` assembles:
+`get_available_tools(groups, include_mcp, model_name, subagent_enabled, delegation_policy=...)` assembles:
 1. **Config-defined tools** - Resolved from `config.yaml` via `resolve_variable()`
 2. **MCP tools** - From enabled MCP servers (lazy initialized, cached with mtime invalidation)
 3. **Built-in tools**:
@@ -331,6 +340,8 @@ Proxied through nginx: `/api/langgraph/*` → Gateway LangGraph-compatible runti
    - `update_agent` - Custom-agent-only: persist self-updates to the current agent's `SOUL.md` / `config.yaml` from inside a normal chat (partial update + atomic write). Bound when `agent_name` is set and `is_bootstrap=False`.
 4. **Subagent tool** (if enabled):
    - `task` - Delegate to subagent (description, prompt, subagent_type)
+
+When subagents are enabled, `delegation_policy` is mandatory. `load_parent_tool_set()` returns the exact tools plus the parent-policy and catalog fingerprints used by embedded-agent cache keys. Delegated execution uses strict catalog loading; configured/MCP/ACP/skill discovery failure propagates as `DelegationPolicyError` instead of authorizing against a partial catalog.
 
 **Community tools** (`packages/harness/deerflow/community/`):
 - `tavily/` - Web search (5 results default) and web fetch (4KB limit)

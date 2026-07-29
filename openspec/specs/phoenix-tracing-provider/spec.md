@@ -331,3 +331,16 @@ TBD - Define Phoenix as an opt-in external tracing provider while preserving Dee
 - **AND** 完整 backend Ruff SHALL 通过并写入 verification report
 - **AND** independent whole-branch review artifact SHALL 已存在，且在其生成前 Task 7.12 SHALL 保持未完成
 - **AND** 新的 independent whole-branch review SHALL 报告 0 Critical、0 Important 和无未裁定测试失败
+
+### Requirement: Tracing 不得参与子代理授权
+系统 MUST 将子代理工具组与技能授权绑定到 agent 构造时的不可变业务策略，且 MUST NOT 从 tracing metadata、Phoenix content mode 或 instrumentation 状态恢复授权。
+
+#### Scenario: Phoenix safe mode 重建 metadata
+- **WHEN** Phoenix tracing 开启且 `PHOENIX_CAPTURE_CONTENT=false`，worker 重建实际传给 graph 的 metadata
+- **THEN** 子代理的 effective tools 与 effective skills SHALL 与 tracing 关闭时完全一致
+- **AND** metadata 中缺少或伪造 `tool_groups`、`available_skills` SHALL NOT 扩大或缩小权限
+
+#### Scenario: Tracing 回滚
+- **WHEN** Phoenix 实现或后续 tracing remediation 被回滚
+- **THEN** per-agent delegation policy、单一 fail-closed resolver、catalog fingerprint 和缓存失效边界 SHALL 保留
+- **AND** 系统 SHALL NOT 恢复全局 unrestricted `task` tool
