@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 from langchain.agents import create_agent
-from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool as as_tool
 
@@ -41,7 +41,7 @@ def mcp_secret(x: str) -> str:
 _BOUND: list[list[str]] = []
 
 
-class _RecordingModel(GenericFakeChatModel):
+class _RecordingModel(FakeMessagesListChatModel):
     def bind_tools(self, tools, **kwargs):
         _BOUND.append([getattr(t, "name", None) for t in tools])
         return self
@@ -51,7 +51,7 @@ def _build_graph():
     filtered = [active_tool, tag_mcp_tool(mcp_secret)]
     setup = build_deferred_tool_setup(filtered, enabled=True)
     final = [*filtered, setup.tool_search_tool]
-    model = _RecordingModel(messages=iter([AIMessage(content="done")] * 4))
+    model = _RecordingModel(responses=[AIMessage(content="done")])
     return create_agent(
         model=model,
         tools=final,
@@ -72,7 +72,7 @@ def test_deferred_hidden_when_built_and_run_in_different_contexts():
         graph = await asyncio.create_task(_abuild())
 
         async def run():
-            await graph.ainvoke({"messages": [HumanMessage(content="hi")]})
+            graph.invoke({"messages": [HumanMessage(content="hi")]})
 
         await asyncio.create_task(run())
 

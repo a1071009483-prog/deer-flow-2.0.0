@@ -6,6 +6,8 @@ tool wrapper pins stdio cwd/temp under the thread's mounted user-data tree and
 rewrites returned file references to ``/mnt/user-data/...`` virtual paths.
 """
 
+import hashlib
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -338,6 +340,17 @@ class TestWorkspaceSnapshots:
 
         assert changed == {existing, created}
 
+    def test_same_size_rewrite_with_restored_mtime_is_detected(self, paths: Paths):
+        workspace = paths.sandbox_work_dir("t1", user_id="u1")
+        existing = _workspace_file(paths, "existing.txt", content=b"old")
+        original_stat = existing.stat()
+        before = mcp_tools._snapshot_workspace_files(workspace)
+
+        existing.write_bytes(b"new")
+        os.utime(existing, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+        assert mcp_tools._changed_workspace_files(workspace, before) == [existing]
+
     def test_snapshot_of_missing_directory_is_empty(self, tmp_path: Path):
         assert mcp_tools._snapshot_workspace_files(tmp_path / "does-not-exist") == {}
 
@@ -367,7 +380,14 @@ class TestPrepareStdioWorkspace:
         assert source_base_dir == paths.sandbox_work_dir("t1", user_id="u1")
         assert tmp_dir == source_base_dir / mcp_tools._MCP_TMP_SUBDIR
         assert tmp_dir.is_dir()
-        assert before == {existing: (existing.stat().st_mtime_ns, existing.stat().st_size)}
+        assert before == {
+            existing: (
+                existing.stat().st_mtime_ns,
+                existing.stat().st_ctime_ns,
+                existing.stat().st_size,
+                hashlib.blake2b(b"old", digest_size=16).digest(),
+            )
+        }
 
 
 class TestResultHasTextContent:

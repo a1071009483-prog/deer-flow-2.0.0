@@ -10,10 +10,8 @@ This is the behavior #3272's redesign depends on (no ContextVar): promotion
 flows through graph state, so it works regardless of build/execute context.
 """
 
-import asyncio
-
 from langchain.agents import create_agent
-from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool as as_tool
 
@@ -44,7 +42,7 @@ def mcp_other(x: str) -> str:
 def test_tool_search_promotes_into_next_turn():
     bound: list[list[str]] = []
 
-    class RecordingModel(GenericFakeChatModel):
+    class RecordingModel(FakeMessagesListChatModel):
         def bind_tools(self, tools, **kwargs):
             bound.append([getattr(t, "name", None) for t in tools])
             return self
@@ -52,7 +50,7 @@ def test_tool_search_promotes_into_next_turn():
     setup = build_deferred_tool_setup([active_tool, tag_mcp_tool(mcp_calc), tag_mcp_tool(mcp_other)], enabled=True)
     turn1 = AIMessage(content="", tool_calls=[{"name": "tool_search", "args": {"query": "select:mcp_calc"}, "id": "c1", "type": "tool_call"}])
     turn2 = AIMessage(content="done")
-    model = RecordingModel(messages=iter([turn1, turn2]))
+    model = RecordingModel(responses=[turn1, turn2])
 
     graph = create_agent(
         model=model,
@@ -61,7 +59,7 @@ def test_tool_search_promotes_into_next_turn():
         state_schema=ThreadState,
     )
 
-    result = asyncio.run(graph.ainvoke({"messages": [HumanMessage(content="use the deferred calculator")]}))
+    result = graph.invoke({"messages": [HumanMessage(content="use the deferred calculator")]})
 
     assert len(bound) >= 2, f"expected >=2 model binds, got {bound}"
     # Turn 1: both deferred MCP tools hidden.
