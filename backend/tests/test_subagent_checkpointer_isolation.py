@@ -58,7 +58,20 @@ def _setup_executor_module():
     sys.modules["deerflow.skills.storage"] = storage_module
 
     from deerflow.subagents.config import SubagentConfig
-    from deerflow.subagents.executor import SubagentExecutor
+    from deerflow.subagents.delegation import DelegationPolicy, DelegationRequest, ResolvedDelegation
+    from deerflow.subagents.executor import SubagentExecutor as ProductionSubagentExecutor
+
+    class SubagentExecutor(ProductionSubagentExecutor):
+        def __init__(self, *, config, tools, **kwargs):
+            policy = DelegationPolicy(tool_groups=None, available_skills=None)
+            request = DelegationRequest(subagent_type=config.name)
+            resolved = ResolvedDelegation(
+                parent_policy=policy,
+                request=request,
+                effective_skills=None,
+                tools=tuple(tools),
+            )
+            super().__init__(config=config, resolved_delegation=resolved, **kwargs)
 
     executor_module = sys.modules["deerflow.subagents.executor"]
     executor_module.get_app_config = _default_app_config

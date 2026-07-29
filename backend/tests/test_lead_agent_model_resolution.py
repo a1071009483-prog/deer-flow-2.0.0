@@ -15,6 +15,7 @@ from deerflow.config.memory_config import MemoryConfig
 from deerflow.config.model_config import ModelConfig
 from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.config.summarization_config import SummarizationConfig
+from deerflow.subagents.delegation import DelegationPolicy
 
 
 def _make_app_config(models: list[ModelConfig], loop_detection: LoopDetectionConfig | None = None) -> AppConfig:
@@ -289,18 +290,21 @@ def test_make_lead_agent_reads_runtime_options_from_context(monkeypatch):
     monkeypatch.setattr(lead_agent_module, "create_chat_model", _fake_create_chat_model)
     monkeypatch.setattr(lead_agent_module, "create_agent", lambda **kwargs: kwargs)
 
-    result = lead_agent_module.make_lead_agent(
-        {
-            "context": {
-                "model_name": "context-model",
-                "thinking_enabled": False,
-                "reasoning_effort": "high",
-                "is_plan_mode": True,
-                "subagent_enabled": True,
-                "max_concurrent_subagents": 7,
-            }
-        }
-    )
+    runnable_config = {
+        "context": {
+            "model_name": "context-model",
+            "thinking_enabled": False,
+            "reasoning_effort": "high",
+            "is_plan_mode": True,
+            "subagent_enabled": True,
+            "max_concurrent_subagents": 7,
+        },
+        "metadata": {
+            "request_id": "request-1",
+            "langfuse_session_id": "session-1",
+        },
+    }
+    result = lead_agent_module.make_lead_agent(runnable_config)
 
     assert captured == {
         "name": "context-model",
@@ -308,7 +312,17 @@ def test_make_lead_agent_reads_runtime_options_from_context(monkeypatch):
         "reasoning_effort": "high",
         "app_config": app_config,
     }
-    get_available_tools.assert_called_once_with(model_name="context-model", groups=None, subagent_enabled=True, app_config=app_config)
+    get_available_tools.assert_called_once_with(
+        model_name="context-model",
+        groups=None,
+        subagent_enabled=True,
+        app_config=app_config,
+        delegation_policy=DelegationPolicy(tool_groups=None, available_skills=None),
+    )
+    assert runnable_config["metadata"]["request_id"] == "request-1"
+    assert runnable_config["metadata"]["langfuse_session_id"] == "session-1"
+    assert "tool_groups" not in runnable_config["metadata"]
+    assert "available_skills" not in runnable_config["metadata"]
     assert result["model"] is not None
 
 

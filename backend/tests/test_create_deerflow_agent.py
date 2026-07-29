@@ -154,14 +154,30 @@ def test_view_image_middleware_preserves_viewed_images_reducer():
 # ---------------------------------------------------------------------------
 @patch("deerflow.agents.factory.create_agent")
 def test_subagent_injects_task_tool(mock_create_agent):
+    from deerflow.subagents.delegation import DelegationPolicy
+
     mock_create_agent.return_value = MagicMock()
     feat = RuntimeFeatures(subagent=True, sandbox=False)
 
-    create_deerflow_agent(_make_mock_model(), features=feat)
+    create_deerflow_agent(
+        _make_mock_model(),
+        features=feat,
+        delegation_policy=DelegationPolicy(tool_groups=None, available_skills=None),
+    )
 
     call_kwargs = mock_create_agent.call_args[1]
     tool_names = [t.name for t in call_kwargs["tools"]]
     assert "task" in tool_names
+
+
+def test_subagent_feature_requires_explicit_delegation_policy():
+    from deerflow.subagents.delegation import DelegationPolicyError
+
+    with pytest.raises(DelegationPolicyError, match="delegation_policy is required"):
+        create_deerflow_agent(
+            _make_mock_model(),
+            features=RuntimeFeatures(subagent=True, sandbox=False),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +785,8 @@ def test_guardrail_default_off(mock_create_agent):
 def test_full_chain_order(mock_create_agent):
     from langchain.agents.middleware import AgentMiddleware as AM
 
+    from deerflow.subagents.delegation import DelegationPolicy
+
     mock_create_agent.return_value = MagicMock()
 
     class MyGuardrail(AM):
@@ -786,7 +804,12 @@ def test_full_chain_order(mock_create_agent):
         auto_title=True,
         guardrail=MyGuardrail(),
     )
-    create_deerflow_agent(_make_mock_model(), features=feat, plan_mode=True)
+    create_deerflow_agent(
+        _make_mock_model(),
+        features=feat,
+        plan_mode=True,
+        delegation_policy=DelegationPolicy(tool_groups=None, available_skills=None),
+    )
 
     call_kwargs = mock_create_agent.call_args[1]
     mw_types = [type(m).__name__ for m in call_kwargs["middleware"]]

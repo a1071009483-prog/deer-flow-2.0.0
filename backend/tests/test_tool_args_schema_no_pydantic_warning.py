@@ -27,9 +27,10 @@ from deerflow.sandbox.tools import (
     str_replace_tool,
     write_file_tool,
 )
+from deerflow.subagents.delegation import DelegationPolicy
 from deerflow.tools.builtins.present_file_tool import present_file_tool
 from deerflow.tools.builtins.setup_agent_tool import setup_agent
-from deerflow.tools.builtins.task_tool import task_tool
+from deerflow.tools.builtins.task_tool import build_task_tool
 from deerflow.tools.builtins.update_agent_tool import update_agent
 from deerflow.tools.builtins.view_image_tool import view_image_tool
 from deerflow.tools.skill_manage_tool import skill_manage_tool
@@ -47,6 +48,9 @@ def _make_runtime(context: dict) -> ToolRuntime:
     )
 
 
+_TASK_TOOL = build_task_tool(DelegationPolicy(tool_groups=None, available_skills=None))
+
+
 _TOOL_CASES = [
     (bash_tool, {"description": "list", "command": "ls"}),
     (ls_tool, {"description": "list", "path": "/tmp"}),
@@ -57,7 +61,7 @@ _TOOL_CASES = [
     (str_replace_tool, {"description": "replace", "path": "/tmp/x", "old_str": "a", "new_str": "b"}),
     (present_file_tool, {"filepaths": ["/tmp/x"], "tool_call_id": "call-1"}),
     (view_image_tool, {"image_path": "/tmp/img.png", "tool_call_id": "call-1"}),
-    (task_tool, {"description": "do", "prompt": "go", "subagent_type": "general-purpose", "tool_call_id": "call-1"}),
+    (_TASK_TOOL, {"description": "do", "prompt": "go", "subagent_type": "general-purpose", "tool_call_id": "call-1"}),
     (skill_manage_tool, {"action": "list", "name": "demo"}),
     (setup_agent, {"soul": "s", "description": "d"}),
     (update_agent, {}),

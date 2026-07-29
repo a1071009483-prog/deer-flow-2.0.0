@@ -91,11 +91,37 @@ def _setup_executor_classes():
     from langchain_core.messages import AIMessage, HumanMessage
 
     from deerflow.subagents.config import SubagentConfig
+    from deerflow.subagents.delegation import (
+        DelegationPolicy,
+        DelegationRequest,
+        ResolvedDelegation,
+    )
     from deerflow.subagents.executor import (
-        SubagentExecutor,
+        SubagentExecutor as ProductionSubagentExecutor,
+    )
+    from deerflow.subagents.executor import (
         SubagentResult,
         SubagentStatus,
     )
+
+    class SubagentExecutor(ProductionSubagentExecutor):
+        """Test adapter that makes the authorization decision explicit."""
+
+        def __init__(self, *, config, tools, **kwargs):
+            policy = DelegationPolicy(tool_groups=None, available_skills=None)
+            request = DelegationRequest(
+                subagent_type=config.name,
+                requested_tools=tuple(config.tools) if config.tools is not None else None,
+                disallowed_tools=tuple(config.disallowed_tools or ()),
+                requested_skills=tuple(config.skills) if config.skills is not None else None,
+            )
+            resolved = ResolvedDelegation(
+                parent_policy=policy,
+                request=request,
+                effective_skills=tuple(config.skills) if config.skills is not None else None,
+                tools=tuple(tools),
+            )
+            super().__init__(config=config, resolved_delegation=resolved, **kwargs)
 
     executor_module = sys.modules["deerflow.subagents.executor"]
 
@@ -111,6 +137,7 @@ def _setup_executor_classes():
         "HumanMessage": HumanMessage,
         "SubagentConfig": SubagentConfig,
         "SubagentExecutor": SubagentExecutor,
+        "ProductionSubagentExecutor": ProductionSubagentExecutor,
         "SubagentResult": SubagentResult,
         "SubagentStatus": SubagentStatus,
     }
@@ -252,6 +279,59 @@ def msg(classes):
 
 class TestAgentConstruction:
     """Test _create_agent() wiring before execution starts."""
+
+    def test_constructor_consumes_resolved_decision_without_reinterpreting_config(self, classes):
+        from deerflow.subagents.delegation import (
+            DelegationPolicy,
+            DelegationRequest,
+            ResolvedDelegation,
+        )
+
+        config = classes["SubagentConfig"](
+            name="test-agent",
+            description="Test agent",
+            tools=["raw-config-tool"],
+            skills=["raw-config-skill"],
+        )
+        resolved_tool = NamedTool("resolved-tool")
+        resolved = ResolvedDelegation(
+            parent_policy=DelegationPolicy(tool_groups=("safe",), available_skills=frozenset({"resolved-skill"})),
+            request=DelegationRequest(subagent_type="test-agent"),
+            effective_skills=("resolved-skill",),
+            tools=(resolved_tool,),
+        )
+
+        executor = classes["ProductionSubagentExecutor"](
+            config=config,
+            resolved_delegation=resolved,
+            parent_model="test-model",
+        )
+
+        assert executor.resolved_delegation is resolved
+        assert executor.tools == [resolved_tool]
+        assert executor._base_tools == [resolved_tool]
+
+    def test_constructor_rejects_mismatched_resolved_subagent(self, classes, base_config):
+        from deerflow.subagents.delegation import (
+            DelegationPolicy,
+            DelegationPolicyError,
+            DelegationRequest,
+            ResolvedDelegation,
+        )
+
+        resolved = ResolvedDelegation(
+            parent_policy=DelegationPolicy(tool_groups=None, available_skills=None),
+            request=DelegationRequest(subagent_type="different-agent"),
+            effective_skills=None,
+            tools=(),
+        )
+
+        with pytest.raises(DelegationPolicyError, match="does not match"):
+            classes["ProductionSubagentExecutor"](
+                config=base_config,
+                resolved_delegation=resolved,
+                parent_model="test-model",
+            )
 
     def test_create_agent_threads_explicit_app_config_to_model_and_middlewares(
         self,
@@ -624,7 +704,9 @@ class TestAgentConstruction:
         )
         executor = SubagentExecutor(
             config=config,
-            tools=[active_tool, tag_mcp_tool(mcp_allowed), tag_mcp_tool(mcp_denied)],
+            # Authorization is resolved before executor construction. The
+            # denied tool must never cross this boundary.
+            tools=[active_tool, tag_mcp_tool(mcp_allowed)],
             thread_id="test-thread",
         )
 
@@ -925,96 +1007,25 @@ class TestAsyncExecutionPath:
 
 class TestSkillAllowedTools:
     @pytest.mark.anyio
-    async def test_skill_allowed_tools_union_filters_agent_tools(self, classes, base_config, mock_agent, msg):
+    async def test_executor_does_not_reinterpret_resolved_tools(self, classes, base_config, mock_agent, msg):
         SubagentExecutor = classes["SubagentExecutor"]
 
         final_state = {"messages": [msg.human("Task"), msg.ai("Done", "msg-1")]}
         mock_agent.astream = lambda *args, **kwargs: async_iterator([final_state])
-        tools = [NamedTool("bash"), NamedTool("read_file"), NamedTool("web_search")]
+        tools = [NamedTool("read_file")]
         executor = SubagentExecutor(config=base_config, tools=tools, thread_id="test-thread")
 
         async def load_skills():
-            return [_skill("a", ["bash"]), _skill("b", ["read_file"])]
-
-        with patch.object(executor, "_load_skills", load_skills), patch.object(executor, "_create_agent", return_value=mock_agent) as create_agent_mock:
-            await executor._aexecute("Task")
-
-        create_agent_mock.assert_called_once()
-        assert [tool.name for tool in create_agent_mock.call_args.args[0]] == ["bash", "read_file"]
-        assert [tool.name for tool in executor.tools] == ["bash", "read_file", "web_search"]
-
-    @pytest.mark.anyio
-    async def test_all_missing_allowed_tools_preserves_legacy_allow_all(self, classes, base_config, mock_agent, msg):
-        SubagentExecutor = classes["SubagentExecutor"]
-
-        final_state = {"messages": [msg.human("Task"), msg.ai("Done", "msg-1")]}
-        mock_agent.astream = lambda *args, **kwargs: async_iterator([final_state])
-        tools = [NamedTool("bash"), NamedTool("read_file"), NamedTool("web_search")]
-        executor = SubagentExecutor(config=base_config, tools=tools, thread_id="test-thread")
-
-        async def load_skills():
-            return [_skill("legacy-a", None), _skill("legacy-b", None)]
-
-        with patch.object(executor, "_load_skills", load_skills), patch.object(executor, "_create_agent", return_value=mock_agent) as create_agent_mock:
-            await executor._aexecute("Task")
-
-        assert [tool.name for tool in create_agent_mock.call_args.args[0]] == ["bash", "read_file", "web_search"]
-        assert [tool.name for tool in executor.tools] == ["bash", "read_file", "web_search"]
-
-    @pytest.mark.anyio
-    async def test_mixed_missing_allowed_tools_does_not_disable_explicit_restrictions(self, classes, base_config, mock_agent, msg):
-        SubagentExecutor = classes["SubagentExecutor"]
-
-        final_state = {"messages": [msg.human("Task"), msg.ai("Done", "msg-1")]}
-        mock_agent.astream = lambda *args, **kwargs: async_iterator([final_state])
-        tools = [NamedTool("bash"), NamedTool("read_file"), NamedTool("web_search")]
-        executor = SubagentExecutor(config=base_config, tools=tools, thread_id="test-thread")
-
-        async def load_skills():
+            # Skill declarations are content at this boundary. Their tool
+            # policy was already consumed by resolve_delegation().
             return [_skill("legacy", None), _skill("restricted", ["bash"])]
 
         with patch.object(executor, "_load_skills", load_skills), patch.object(executor, "_create_agent", return_value=mock_agent) as create_agent_mock:
             await executor._aexecute("Task")
 
-        assert [tool.name for tool in create_agent_mock.call_args.args[0]] == ["bash"]
-        assert [tool.name for tool in executor.tools] == ["bash", "read_file", "web_search"]
-
-    @pytest.mark.anyio
-    async def test_mixed_missing_allowed_tools_order_does_not_disable_explicit_restrictions(self, classes, base_config, mock_agent, msg):
-        SubagentExecutor = classes["SubagentExecutor"]
-
-        final_state = {"messages": [msg.human("Task"), msg.ai("Done", "msg-1")]}
-        mock_agent.astream = lambda *args, **kwargs: async_iterator([final_state])
-        tools = [NamedTool("bash"), NamedTool("read_file"), NamedTool("web_search")]
-        executor = SubagentExecutor(config=base_config, tools=tools, thread_id="test-thread")
-
-        async def load_skills():
-            return [_skill("restricted", ["bash"]), _skill("legacy", None)]
-
-        with patch.object(executor, "_load_skills", load_skills), patch.object(executor, "_create_agent", return_value=mock_agent) as create_agent_mock:
-            await executor._aexecute("Task")
-
-        assert [tool.name for tool in create_agent_mock.call_args.args[0]] == ["bash"]
-        assert [tool.name for tool in executor.tools] == ["bash", "read_file", "web_search"]
-
-    @pytest.mark.anyio
-    async def test_empty_allowed_tools_contributes_no_tools(self, classes, base_config, mock_agent, msg, caplog):
-        SubagentExecutor = classes["SubagentExecutor"]
-
-        final_state = {"messages": [msg.human("Task"), msg.ai("Done", "msg-1")]}
-        mock_agent.astream = lambda *args, **kwargs: async_iterator([final_state])
-        tools = [NamedTool("bash"), NamedTool("read_file"), NamedTool("web_search")]
-        executor = SubagentExecutor(config=base_config, tools=tools, thread_id="test-thread")
-
-        async def load_skills():
-            return [_skill("empty", []), _skill("reader", ["read_file"])]
-
-        with patch.object(executor, "_load_skills", load_skills), patch.object(executor, "_create_agent", return_value=mock_agent) as create_agent_mock, caplog.at_level("INFO"):
-            await executor._aexecute("Task")
-
+        create_agent_mock.assert_called_once()
         assert [tool.name for tool in create_agent_mock.call_args.args[0]] == ["read_file"]
-        assert [tool.name for tool in executor.tools] == ["bash", "read_file", "web_search"]
-        assert "declared empty allowed-tools" in caplog.text
+        assert [tool.name for tool in executor.tools] == ["read_file"]
 
     @pytest.mark.anyio
     async def test_skill_load_failure_fails_without_creating_agent(self, classes, base_config, mock_agent):

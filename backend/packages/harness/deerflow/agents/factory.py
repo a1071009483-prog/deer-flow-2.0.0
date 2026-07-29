@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
 
+    from deerflow.subagents.delegation import DelegationPolicy
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,6 +72,7 @@ def create_deerflow_agent(
     state_schema: type | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     name: str = "default",
+    delegation_policy: DelegationPolicy | None = None,
 ) -> CompiledStateGraph:
     """Create a DeerFlow agent from plain Python arguments.
 
@@ -128,6 +131,7 @@ def create_deerflow_agent(
             name=name,
             plan_mode=plan_mode,
             extra_middleware=extra_middleware or [],
+            delegation_policy=delegation_policy,
         )
         # Deduplicate by tool name — user-provided tools take priority.
         existing_names = {t.name for t in effective_tools}
@@ -158,6 +162,7 @@ def _assemble_from_features(
     name: str = "default",
     plan_mode: bool = False,
     extra_middleware: list[AgentMiddleware] | None = None,
+    delegation_policy: DelegationPolicy | None = None,
 ) -> tuple[list[AgentMiddleware], list[BaseTool]]:
     """Build an ordered middleware chain + extra tools from *feat*.
 
@@ -262,15 +267,19 @@ def _assemble_from_features(
 
     # --- [11] Subagent ---
     if feat.subagent is not False:
+        if delegation_policy is None:
+            from deerflow.subagents.delegation import DelegationPolicyError
+
+            raise DelegationPolicyError("delegation_policy is required when the subagent feature is enabled")
         if isinstance(feat.subagent, AgentMiddleware):
             chain.append(feat.subagent)
         else:
             from deerflow.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
 
             chain.append(SubagentLimitMiddleware())
-        from deerflow.tools.builtins import task_tool
+        from deerflow.tools.builtins.task_tool import build_task_tool
 
-        extra_tools.append(task_tool)
+        extra_tools.append(build_task_tool(delegation_policy))
 
     # --- [12] LoopDetection ---
     if feat.loop_detection is not False:

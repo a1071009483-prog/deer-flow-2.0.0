@@ -1,4 +1,6 @@
 import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
 from langchain.tools import BaseTool
 
@@ -6,21 +8,50 @@ from deerflow.config import get_app_config
 from deerflow.config.app_config import AppConfig
 from deerflow.reflection import resolve_variable
 from deerflow.sandbox.security import is_host_bash_allowed
-from deerflow.tools.builtins import ask_clarification_tool, present_file_tool, task_tool, view_image_tool
+from deerflow.tools.builtins import ask_clarification_tool, present_file_tool, view_image_tool
 from deerflow.tools.mcp_metadata import tag_mcp_tool
 from deerflow.tools.sync import make_sync_tool_wrapper
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from deerflow.subagents.delegation import DelegationPolicy
 
 BUILTIN_TOOLS = [
     present_file_tool,
     ask_clarification_tool,
 ]
 
-SUBAGENT_TOOLS = [
-    task_tool,
-    # task_status_tool is no longer exposed to LLM (backend handles polling internally)
-]
+ToolSource = Literal["configured", "builtin", "mcp", "acp"]
+
+
+class ToolCatalogLoadError(RuntimeError):
+    """Raised when strict tool discovery cannot produce a complete catalog."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCatalogEntry:
+    tool: BaseTool
+    source: ToolSource
+    configured_group: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCatalogSnapshot:
+    """One immutable load of the tools visible to an agent build."""
+
+    entries: tuple[ToolCatalogEntry, ...]
+    known_tool_names: frozenset[str]
+    known_groups: frozenset[str]
+
+    def project(self, groups: tuple[str, ...] | list[str] | None = None) -> list[BaseTool]:
+        allowed_groups = set(groups) if groups is not None else None
+        projected = [
+            entry.tool
+            for entry in self.entries
+            if entry.source != "configured" or allowed_groups is None or entry.configured_group in allowed_groups
+        ]
+        return _deduplicate_tools(projected)
 
 
 def _is_host_bash_tool(tool: object) -> bool:
@@ -41,53 +72,75 @@ def _ensure_sync_invocable_tool(tool: BaseTool) -> BaseTool:
     return tool
 
 
-def get_available_tools(
-    groups: list[str] | None = None,
+def _deduplicate_tools(tools: list[BaseTool]) -> list[BaseTool]:
+    seen_names: set[str] = set()
+    unique_tools: list[BaseTool] = []
+    for candidate in tools:
+        tool = _ensure_sync_invocable_tool(candidate)
+        if tool.name not in seen_names:
+            unique_tools.append(tool)
+            seen_names.add(tool.name)
+        else:
+            logger.warning(
+                "Duplicate tool name %r detected and skipped — check your config.yaml and MCP server registrations (issue #1803).",
+                tool.name,
+            )
+    return unique_tools
+
+
+def load_available_tool_catalog(
+    *,
     include_mcp: bool = True,
     model_name: str | None = None,
-    subagent_enabled: bool = False,
-    *,
     app_config: AppConfig | None = None,
-) -> list[BaseTool]:
-    """Get all available tools from config.
+    strict: bool = False,
+) -> ToolCatalogSnapshot:
+    """Load configured and independently governed tools exactly once.
 
-    Note: MCP tools should be initialized at application startup using
-    `initialize_mcp_tools()` from deerflow.mcp module.
-
-    Args:
-        groups: Optional list of tool groups to filter by.
-        include_mcp: Whether to include tools from MCP servers (default: True).
-        model_name: Optional model name to determine if vision tools should be included.
-        subagent_enabled: Whether to include subagent tools (task, task_status).
-
-    Returns:
-        List of available tools.
+    ``strict=True`` is used by delegation authorization. Discovery failures
+    raise instead of returning a partial catalog, so authorization fails
+    closed. Tool-group projection is deliberately deferred to
+    :meth:`ToolCatalogSnapshot.project`; groups apply only to configured tools,
+    not to built-ins, MCP, or ACP integrations.
     """
     config = app_config or get_app_config()
-    tool_configs = [tool for tool in config.tools if groups is None or tool.group in groups]
+    known_names = {tool.name for tool in config.tools}
+    known_names.add("task")  # Reserved delegation surface, never delegated.
+    known_groups = {group.name for group in config.tool_groups}
+    known_groups.update(tool.group for tool in config.tools)
+    entries: list[ToolCatalogEntry] = []
 
-    # Do not expose host bash by default when LocalSandboxProvider is active.
-    if not is_host_bash_allowed(config):
-        tool_configs = [tool for tool in tool_configs if not _is_host_bash_tool(tool)]
+    host_bash_allowed = is_host_bash_allowed(config)
+    for tool_config in config.tools:
+        # Preserve the existing security boundary and avoid importing a host
+        # execution surface that cannot be exposed in this process.
+        if not host_bash_allowed and _is_host_bash_tool(tool_config):
+            continue
+        try:
+            loaded = resolve_variable(tool_config.use, BaseTool)
+        except Exception as exc:
+            if strict:
+                raise ToolCatalogLoadError(f"Failed to resolve configured tool {tool_config.name!r}") from exc
+            # Configured-tool failures historically abort agent construction;
+            # non-strict applies only to optional MCP/ACP discovery.
+            raise
 
-    loaded_tools_raw = [(cfg, resolve_variable(cfg.use, BaseTool)) for cfg in tool_configs]
-
-    # Warn when the config ``name`` field and the tool object's ``.name``
-    # attribute diverge — this mismatch is the root cause of issue #1803 where
-    # the LLM receives one name in its tool schema but the runtime router
-    # recognises a different name, producing "not a valid tool" errors.
-    for cfg, loaded in loaded_tools_raw:
-        if cfg.name != loaded.name:
+        known_names.add(loaded.name)
+        if tool_config.name != loaded.name:
             logger.warning(
                 "Tool name mismatch: config name %r does not match tool .name %r (use: %s). The tool's own .name will be used for binding.",
-                cfg.name,
+                tool_config.name,
                 loaded.name,
-                cfg.use,
+                tool_config.use,
             )
+        entries.append(
+            ToolCatalogEntry(
+                tool=_ensure_sync_invocable_tool(loaded),
+                source="configured",
+                configured_group=tool_config.group,
+            )
+        )
 
-    loaded_tools = [_ensure_sync_invocable_tool(t) for _, t in loaded_tools_raw]
-
-    # Conditionally add tools based on config
     builtin_tools = BUILTIN_TOOLS.copy()
     skill_evolution_config = getattr(config, "skill_evolution", None)
     if getattr(skill_evolution_config, "enabled", False):
@@ -95,55 +148,44 @@ def get_available_tools(
 
         builtin_tools.append(skill_manage_tool)
 
-    # Add subagent tools only if enabled via runtime parameter
-    if subagent_enabled:
-        builtin_tools.extend(SUBAGENT_TOOLS)
-        logger.info("Including subagent tools (task)")
-
-    # If no model_name specified, use the first model (default)
     if model_name is None and config.models:
         model_name = config.models[0].name
-
-    # Add view_image_tool only if the model supports vision
     model_config = config.get_model_config(model_name) if model_name else None
     if model_config is not None and model_config.supports_vision:
         builtin_tools.append(view_image_tool)
-        logger.info(f"Including view_image_tool for model '{model_name}' (supports_vision=True)")
+        logger.info("Including view_image_tool for model %r (supports_vision=True)", model_name)
 
-    # Get cached MCP tools if enabled
-    # NOTE: We use ExtensionsConfig.from_file() instead of config.extensions
-    # to always read the latest configuration from disk. This ensures that changes
-    # made through the Gateway API (which runs in a separate process) are immediately
-    # reflected when loading MCP tools.
-    mcp_tools = []
+    for builtin in builtin_tools:
+        known_names.add(builtin.name)
+        entries.append(ToolCatalogEntry(tool=builtin, source="builtin", configured_group=None))
+
+    mcp_tools: list[BaseTool] = []
     if include_mcp:
         try:
             from deerflow.config.extensions_config import ExtensionsConfig
-            from deerflow.mcp.cache import get_cached_mcp_tools
 
             extensions_config = ExtensionsConfig.from_file()
             if extensions_config.get_enabled_mcp_servers():
-                mcp_tools = get_cached_mcp_tools()
-                if mcp_tools:
-                    logger.info(f"Using {len(mcp_tools)} cached MCP tool(s)")
+                from deerflow.mcp.cache import get_cached_mcp_tools
 
-                    # Tag MCP-sourced tools so deferred-tool assembly (done at
-                    # the agent construction site, AFTER tool-policy filtering)
-                    # can identify them. No ContextVar / registry is built here;
-                    # the deferred catalog + tool_search tool are assembled per
-                    # agent from the policy-filtered tool list.
-                    for t in mcp_tools:
-                        tag_mcp_tool(t)
-        except ImportError:
+                mcp_tools = list(get_cached_mcp_tools())
+                for mcp_tool in mcp_tools:
+                    tag_mcp_tool(mcp_tool)
+        except ImportError as exc:
+            if strict:
+                raise ToolCatalogLoadError("MCP tool support is unavailable") from exc
             logger.warning("MCP module not available. Install 'langchain-mcp-adapters' package to enable MCP tools.")
-        except Exception as e:
-            logger.error(f"Failed to get cached MCP tools: {e}")
+        except Exception as exc:
+            if strict:
+                raise ToolCatalogLoadError("Failed to load MCP tool catalog") from exc
+            logger.error("Failed to get cached MCP tools", exc_info=True)
 
-    # Add invoke_acp_agent tool if any ACP agents are configured
+    for mcp_tool in mcp_tools:
+        known_names.add(mcp_tool.name)
+        entries.append(ToolCatalogEntry(tool=mcp_tool, source="mcp", configured_group=None))
+
     acp_tools: list[BaseTool] = []
     try:
-        from deerflow.tools.builtins.invoke_acp_agent_tool import build_invoke_acp_agent_tool
-
         if app_config is None:
             from deerflow.config.acp_config import get_acp_agents
 
@@ -151,26 +193,68 @@ def get_available_tools(
         else:
             acp_agents = getattr(config, "acp_agents", {}) or {}
         if acp_agents:
+            from deerflow.tools.builtins.invoke_acp_agent_tool import build_invoke_acp_agent_tool
+
             acp_tools.append(build_invoke_acp_agent_tool(acp_agents))
-            logger.info(f"Including invoke_acp_agent tool ({len(acp_agents)} agent(s): {list(acp_agents.keys())})")
-    except Exception as e:
-        logger.warning(f"Failed to load ACP tool: {e}")
+    except Exception as exc:
+        if strict:
+            raise ToolCatalogLoadError("Failed to load ACP tool catalog") from exc
+        logger.warning("Failed to load ACP tool", exc_info=True)
 
-    logger.info(f"Total tools loaded: {len(loaded_tools)}, built-in tools: {len(builtin_tools)}, MCP tools: {len(mcp_tools)}, ACP tools: {len(acp_tools)}")
+    for acp_tool in acp_tools:
+        known_names.add(acp_tool.name)
+        entries.append(ToolCatalogEntry(tool=acp_tool, source="acp", configured_group=None))
 
-    # Deduplicate by tool name — config-loaded tools take priority, followed by
-    # built-ins, MCP tools, and ACP tools.  Duplicate names cause the LLM to
-    # receive ambiguous or concatenated function schemas (issue #1803).
-    all_tools = [_ensure_sync_invocable_tool(t) for t in loaded_tools + builtin_tools + mcp_tools + acp_tools]
-    seen_names: set[str] = set()
-    unique_tools: list[BaseTool] = []
-    for t in all_tools:
-        if t.name not in seen_names:
-            unique_tools.append(t)
-            seen_names.add(t.name)
-        else:
-            logger.warning(
-                "Duplicate tool name %r detected and skipped — check your config.yaml and MCP server registrations (issue #1803).",
-                t.name,
-            )
-    return unique_tools
+    logger.info(
+        "Tool catalog loaded: configured=%d, builtins=%d, MCP=%d, ACP=%d",
+        sum(entry.source == "configured" for entry in entries),
+        len(builtin_tools),
+        len(mcp_tools),
+        len(acp_tools),
+    )
+    return ToolCatalogSnapshot(
+        entries=tuple(entries),
+        known_tool_names=frozenset(known_names),
+        known_groups=frozenset(known_groups),
+    )
+
+
+def get_available_tools(
+    groups: list[str] | tuple[str, ...] | None = None,
+    include_mcp: bool = True,
+    model_name: str | None = None,
+    subagent_enabled: bool = False,
+    *,
+    app_config: AppConfig | None = None,
+    delegation_policy: "DelegationPolicy | None" = None,
+) -> list[BaseTool]:
+    """Project available tools and optionally append a policy-bound task tool.
+
+    Args:
+        groups: Optional list of tool groups to filter by.
+        include_mcp: Whether to include tools from MCP servers (default: True).
+        model_name: Optional model name to determine if vision tools should be included.
+        subagent_enabled: Whether to include the task delegation tool.
+        delegation_policy: Trusted parent policy required when delegation is
+            enabled. There is intentionally no unrestricted default.
+
+    Returns:
+        List of available tools.
+    """
+    catalog = load_available_tool_catalog(
+        include_mcp=include_mcp,
+        model_name=model_name,
+        app_config=app_config,
+        strict=False,
+    )
+    tools = catalog.project(groups)
+    if subagent_enabled:
+        if delegation_policy is None:
+            from deerflow.subagents.delegation import DelegationPolicyError
+
+            raise DelegationPolicyError("delegation_policy is required when subagent_enabled=True")
+        from deerflow.tools.builtins.task_tool import build_task_tool
+
+        tools.append(build_task_tool(delegation_policy))
+        logger.info("Including subagent tools (task)")
+    return _deduplicate_tools(tools)

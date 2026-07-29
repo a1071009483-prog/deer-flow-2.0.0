@@ -82,16 +82,24 @@ def _real_subagent_executor() -> Iterator[type]:
 async def test_load_skills_via_to_thread_does_not_block_event_loop(tmp_path: Path) -> None:
     from deerflow.config.skills_config import SkillsConfig
     from deerflow.subagents.config import SubagentConfig
+    from deerflow.subagents.delegation import DelegationPolicy, DelegationRequest, ResolvedDelegation
 
     _seed_skill(tmp_path)
 
     with _real_subagent_executor() as SubagentExecutor:
+        config = SubagentConfig(
+            name="demo",
+            description="Loads skills through the production async path.",
+        )
+        policy = DelegationPolicy(tool_groups=None, available_skills=None)
         executor = SubagentExecutor(
-            config=SubagentConfig(
-                name="demo",
-                description="Loads skills through the production async path.",
+            config=config,
+            resolved_delegation=ResolvedDelegation(
+                parent_policy=policy,
+                request=DelegationRequest(subagent_type="demo"),
+                effective_skills=None,
+                tools=(),
             ),
-            tools=[],
             app_config=SimpleNamespace(skills=SkillsConfig(path=str(tmp_path))),
             parent_model="test-model",
         )

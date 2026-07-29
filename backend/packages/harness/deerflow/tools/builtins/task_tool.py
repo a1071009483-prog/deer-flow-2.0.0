@@ -3,11 +3,11 @@
 import asyncio
 import logging
 import uuid
-from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from langchain.tools import InjectedToolCallId, tool
 from langchain_core.callbacks import BaseCallbackManager
+from langchain_core.tools import BaseTool
 from langgraph.config import get_stream_writer
 
 from deerflow.config import get_app_config
@@ -15,7 +15,7 @@ from deerflow.config.tracing_config import get_tracing_config
 from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.sandbox.security import LOCAL_BASH_SUBAGENT_DISABLED_MESSAGE, is_host_bash_allowed
 from deerflow.subagents import SubagentExecutor, get_available_subagent_names, get_subagent_config
-from deerflow.subagents.config import resolve_subagent_model_name
+from deerflow.subagents.delegation import DelegationPolicy, DelegationPolicyError, DelegationRequest, resolve_delegation
 from deerflow.subagents.executor import (
     SubagentStatus,
     cleanup_background_task,
@@ -178,62 +178,49 @@ def _get_runtime_app_config(runtime: Any) -> "AppConfig | None":
     return None
 
 
-def _merge_skill_allowlists(parent: list[str] | None, child: list[str] | None) -> list[str] | None:
-    """Return the effective subagent skill allowlist under the parent policy."""
-    if parent is None:
-        return child
-    if child is None:
-        return list(parent)
+def build_task_tool(delegation_policy: DelegationPolicy) -> BaseTool:
+    """Build one task tool bound to an immutable trusted parent policy."""
 
-    parent_set = set(parent)
-    return [skill for skill in child if skill in parent_set]
+    @tool("task", parse_docstring=True)
+    async def task(
+        runtime: Runtime,
+        description: str,
+        prompt: str,
+        subagent_type: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> str:
+        """Delegate work to a specialized subagent that runs in its own context.
+
+        Args:
+            description: A short 3-5 word description for logging and display.
+            prompt: A specific and complete task for the subagent.
+            subagent_type: The configured subagent type to execute.
+        """
+        return await _run_task(
+            delegation_policy=delegation_policy,
+            runtime=runtime,
+            description=description,
+            prompt=prompt,
+            subagent_type=subagent_type,
+            tool_call_id=tool_call_id,
+        )
+
+    return task
 
 
-@tool("task", parse_docstring=True)
-async def task_tool(
+async def _run_task(
+    *,
+    delegation_policy: DelegationPolicy,
     runtime: Runtime,
     description: str,
     prompt: str,
     subagent_type: str,
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> str:
-    """Delegate a task to a specialized subagent that runs in its own context.
-
-    Subagents help you:
-    - Preserve context by keeping exploration and implementation separate
-    - Handle complex multi-step tasks autonomously
-    - Execute commands or operations in isolated contexts
-
-    Built-in subagent types:
-    - **general-purpose**: A capable agent for complex, multi-step tasks that require
-      both exploration and action. Use when the task requires complex reasoning,
-      multiple dependent steps, or would benefit from isolated context.
-    - **bash**: Command execution specialist for running bash commands. This is only
-      available when host bash is explicitly allowed or when using an isolated shell
-      sandbox such as `AioSandboxProvider`.
-
-    Additional custom subagent types may be defined in config.yaml under
-    `subagents.custom_agents`. Each custom type can have its own system prompt,
-    tools, skills, model, and timeout configuration. If an unknown subagent_type
-    is provided, the error message will list all available types.
-
-    When to use this tool:
-    - Complex tasks requiring multiple steps or tools
-    - Tasks that produce verbose output
-    - When you want to isolate context from the main conversation
-    - Parallel research or exploration tasks
-
-    When NOT to use this tool:
-    - Simple, single-step operations (use tools directly)
-    - Tasks requiring user interaction or clarification
-
-    Args:
-        description: A short (3-5 word) description of the task for logging/display. ALWAYS PROVIDE THIS PARAMETER FIRST.
-        prompt: The task description for the subagent. Be specific and clear about what needs to be done. ALWAYS PROVIDE THIS PARAMETER SECOND.
-        subagent_type: The type of subagent to use. ALWAYS PROVIDE THIS PARAMETER THIRD.
-    """
+    """Resolve authorization, start the executor, and stream task progress."""
     runtime_app_config = _get_runtime_app_config(runtime)
-    cache_token_usage = _token_usage_cache_enabled(runtime_app_config)
+    resolved_app_config = runtime_app_config or get_app_config()
+    cache_token_usage = _token_usage_cache_enabled(resolved_app_config)
     available_subagent_names = get_available_subagent_names(app_config=runtime_app_config) if runtime_app_config is not None else get_available_subagent_names()
 
     # Get subagent configuration
@@ -245,13 +232,6 @@ async def task_tool(
         host_bash_allowed = is_host_bash_allowed(runtime_app_config) if runtime_app_config is not None else is_host_bash_allowed()
         if not host_bash_allowed:
             return f"Error: {LOCAL_BASH_SUBAGENT_DISABLED_MESSAGE}"
-
-    # Build config overrides
-    overrides: dict = {}
-
-    # Skills are loaded by SubagentExecutor per-session (aligned with Codex's pattern:
-    # each subagent loads its own skills based on config, injected as conversation items).
-    # No longer appended to system_prompt here.
 
     # Extract parent context from runtime
     sandbox_state = None
@@ -279,33 +259,23 @@ async def task_tool(
     # Get user_id for tracing (uses standard resolution order)
     user_id = resolve_runtime_user_id(runtime)
 
-    parent_available_skills = metadata.get("available_skills")
-    if parent_available_skills is not None:
-        overrides["skills"] = _merge_skill_allowlists(list(parent_available_skills), config.skills)
-
-    if overrides:
-        config = replace(config, **overrides)
-
-    # Get available tools (excluding task tool to prevent nesting)
-    # Lazy import to avoid circular dependency
-    from deerflow.tools import get_available_tools
-
-    # Inherit parent agent's tool_groups so subagents respect the same restrictions
-    parent_tool_groups = metadata.get("tool_groups")
-    resolved_app_config = runtime_app_config
-    if config.model == "inherit" and parent_model is None and resolved_app_config is None:
-        resolved_app_config = get_app_config()
-    effective_model = resolve_subagent_model_name(config, parent_model, app_config=resolved_app_config)
-
-    # Subagents should not have subagent tools enabled (prevent recursive nesting)
-    available_tools_kwargs = {
-        "model_name": effective_model,
-        "groups": parent_tool_groups,
-        "subagent_enabled": False,
-    }
-    if resolved_app_config is not None:
-        available_tools_kwargs["app_config"] = resolved_app_config
-    tools = get_available_tools(**available_tools_kwargs)
+    request = DelegationRequest(
+        subagent_type=subagent_type,
+        requested_tools=tuple(config.tools) if config.tools is not None else None,
+        disallowed_tools=tuple(config.disallowed_tools or ()),
+        requested_skills=tuple(config.skills) if config.skills is not None else None,
+    )
+    try:
+        resolved_delegation = await asyncio.to_thread(
+            resolve_delegation,
+            parent_policy=delegation_policy,
+            request=request,
+            app_config=resolved_app_config,
+            parent_model=parent_model,
+        )
+    except DelegationPolicyError as exc:
+        logger.warning("Delegation authorization denied for %s: %s", subagent_type, exc)
+        return f"Error: Delegation policy denied subagent '{subagent_type}'."
 
     phoenix_config = get_tracing_config().phoenix
     otel_trace_context = capture_current_phoenix_trace_context(include_baggage=phoenix_config.propagate_baggage) if phoenix_config.enabled else capture_current_trace_context(include_baggage=phoenix_config.propagate_baggage)
@@ -313,7 +283,7 @@ async def task_tool(
     # Create executor
     executor_kwargs = {
         "config": config,
-        "tools": tools,
+        "resolved_delegation": resolved_delegation,
         "parent_model": parent_model,
         "sandbox_state": sandbox_state,
         "thread_data": thread_data,
@@ -321,9 +291,8 @@ async def task_tool(
         "trace_id": trace_id,
         "otel_trace_context": otel_trace_context,
         "user_id": user_id,
+        "app_config": resolved_app_config,
     }
-    if resolved_app_config is not None:
-        executor_kwargs["app_config"] = resolved_app_config
     executor = SubagentExecutor(**executor_kwargs)
 
     # Start background execution (always async to prevent blocking)

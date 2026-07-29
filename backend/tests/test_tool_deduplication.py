@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from langchain_core.tools import BaseTool, StructuredTool, tool
 from pydantic import BaseModel, Field
 
+from deerflow.subagents.delegation import DelegationPolicy, DelegationPolicyError
 from deerflow.tools.tools import get_available_tools
 
 # ---------------------------------------------------------------------------
@@ -55,6 +57,7 @@ def _make_minimal_config(tools):
     """Return an AppConfig-like mock with the given tools list."""
     config = MagicMock()
     config.tools = tools
+    config.tool_groups = []
     config.models = []
     config.tool_search.enabled = False
     config.skill_evolution.enabled = False
@@ -97,26 +100,45 @@ def test_config_loaded_async_only_tool_gets_sync_wrapper(mock_bash, mock_cfg):
 
 @patch("deerflow.tools.tools.get_app_config")
 @patch("deerflow.tools.tools.is_host_bash_allowed", return_value=True)
-def test_subagent_async_only_tool_gets_sync_wrapper(mock_bash, mock_cfg):
-    """Async-only tools added through the subagent path can be invoked by sync clients."""
+def test_subagent_loading_requires_explicit_delegation_policy(mock_bash, mock_cfg):
+    """There is no unrestricted default task tool."""
+    mock_cfg.return_value = _make_minimal_config([])
+
+    with patch("deerflow.tools.tools.BUILTIN_TOOLS", []), pytest.raises(
+        DelegationPolicyError,
+        match="delegation_policy is required",
+    ):
+        get_available_tools(include_mcp=False, subagent_enabled=True, app_config=mock_cfg.return_value)
+
+
+@patch("deerflow.tools.tools.get_app_config")
+@patch("deerflow.tools.tools.is_host_bash_allowed", return_value=True)
+def test_subagent_factory_result_gets_sync_wrapper(mock_bash, mock_cfg):
+    """A policy-bound async-only task tool remains sync-client compatible."""
 
     async def async_tool_impl(x: int) -> str:
         return f"subagent: {x}"
 
     async_tool = StructuredTool(
-        name="async_subagent_tool",
-        description="Async-only subagent test tool.",
+        name="task",
+        description="Async-only policy-bound task tool.",
         args_schema=AsyncToolArgs,
         func=None,
         coroutine=async_tool_impl,
     )
     mock_cfg.return_value = _make_minimal_config([])
+    policy = DelegationPolicy(tool_groups=None, available_skills=None)
 
     with (
         patch("deerflow.tools.tools.BUILTIN_TOOLS", []),
-        patch("deerflow.tools.tools.SUBAGENT_TOOLS", [async_tool]),
+        patch("deerflow.tools.builtins.task_tool.build_task_tool", return_value=async_tool),
     ):
-        result = get_available_tools(include_mcp=False, subagent_enabled=True, app_config=mock_cfg.return_value)
+        result = get_available_tools(
+            include_mcp=False,
+            subagent_enabled=True,
+            app_config=mock_cfg.return_value,
+            delegation_policy=policy,
+        )
 
     assert async_tool in result
     assert async_tool.func is not None

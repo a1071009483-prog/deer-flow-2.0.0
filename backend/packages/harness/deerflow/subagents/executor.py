@@ -24,9 +24,9 @@ from deerflow.agents.thread_state import SandboxState, ThreadDataState, ThreadSt
 from deerflow.config import get_app_config
 from deerflow.config.app_config import AppConfig
 from deerflow.models import create_chat_model
-from deerflow.skills.tool_policy import filter_tools_by_skill_allowed_tools
 from deerflow.skills.types import Skill
 from deerflow.subagents.config import SubagentConfig, resolve_subagent_model_name
+from deerflow.subagents.delegation import DelegationPolicyError, ResolvedDelegation
 from deerflow.subagents.token_collector import SubagentTokenCollector
 from deerflow.tracing import (
     PhoenixRootContext,
@@ -253,43 +253,13 @@ def _submit_to_isolated_loop_in_context(
     )
 
 
-def _filter_tools(
-    all_tools: list[BaseTool],
-    allowed: list[str] | None,
-    disallowed: list[str] | None,
-) -> list[BaseTool]:
-    """Filter tools based on subagent configuration.
-
-    Args:
-        all_tools: List of all available tools.
-        allowed: Optional allowlist of tool names. If provided, only these tools are included.
-        disallowed: Optional denylist of tool names. These tools are always excluded.
-
-    Returns:
-        Filtered list of tools.
-    """
-    filtered = all_tools
-
-    # Apply allowlist if specified
-    if allowed is not None:
-        allowed_set = set(allowed)
-        filtered = [t for t in filtered if t.name in allowed_set]
-
-    # Apply denylist
-    if disallowed is not None:
-        disallowed_set = set(disallowed)
-        filtered = [t for t in filtered if t.name not in disallowed_set]
-
-    return filtered
-
-
 class SubagentExecutor:
     """Executor for running subagents."""
 
     def __init__(
         self,
         config: SubagentConfig,
-        tools: list[BaseTool],
+        resolved_delegation: ResolvedDelegation,
         app_config: AppConfig | None = None,
         parent_model: str | None = None,
         sandbox_state: SandboxState | None = None,
@@ -303,7 +273,8 @@ class SubagentExecutor:
 
         Args:
             config: Subagent configuration.
-            tools: List of all available tools (will be filtered).
+            resolved_delegation: Trusted policy decision produced by the
+                delegation resolver. The executor never reconstructs it.
             app_config: Resolved AppConfig. When None, ``_create_agent`` falls
                 back to ``get_app_config()`` (matches the lead-agent factory's
                 pattern).
@@ -319,6 +290,9 @@ class SubagentExecutor:
                 When None, the tracing layer falls back to DEFAULT_USER_ID.
         """
         self.config = config
+        if config.name != resolved_delegation.request.subagent_type:
+            raise DelegationPolicyError("Resolved delegation does not match subagent config")
+        self.resolved_delegation = resolved_delegation
         self.app_config = app_config
         self.parent_model = parent_model
         # Resolve eagerly only when it does not require loading config.yaml; otherwise defer
@@ -336,11 +310,7 @@ class SubagentExecutor:
         self.otel_trace_context = otel_trace_context
         self.user_id = user_id
 
-        self._base_tools = _filter_tools(
-            tools,
-            config.tools,
-            config.disallowed_tools,
-        )
+        self._base_tools = list(resolved_delegation.tools)
         self.tools = self._base_tools
 
         logger.info(f"[trace={self.trace_id}] SubagentExecutor initialized: {config.name} with {len(self.tools)} tools")
@@ -374,8 +344,9 @@ class SubagentExecutor:
         )
 
     async def _load_skills(self) -> list[Skill]:
-        """Load enabled skill metadata based on config.skills."""
-        if self.config.skills is not None and len(self.config.skills) == 0:
+        """Load only skill metadata named by the trusted resolution."""
+        effective_skills = self.resolved_delegation.effective_skills
+        if effective_skills is not None and len(effective_skills) == 0:
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} skills=[] — skipping skill loading")
             return []
 
@@ -395,14 +366,11 @@ class SubagentExecutor:
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} no enabled skills found")
             return []
 
-        # Filter by config.skills whitelist
-        if self.config.skills is not None:
-            allowed = set(self.config.skills)
+        # Filter by the resolver's effective skill whitelist.
+        if effective_skills is not None:
+            allowed = set(effective_skills)
             return [s for s in all_skills if s.name in allowed]
         return all_skills
-
-    def _apply_skill_allowed_tools(self, skills: list[Skill]) -> list[BaseTool]:
-        return filter_tools_by_skill_allowed_tools(self._base_tools, skills)
 
     async def _load_skill_messages(self, skills: list[Skill]) -> list[SystemMessage]:
         """Load skill content as conversation items based on config.skills.
@@ -455,7 +423,7 @@ class SubagentExecutor:
 
         # Load skills as conversation items (Codex pattern)
         skills = await self._load_skills()
-        filtered_tools = self._apply_skill_allowed_tools(skills)
+        filtered_tools = list(self._base_tools)
         # Assemble deferred tool_search AFTER policy filtering (fail-closed),
         # mirroring the lead path so subagents stop binding full MCP schemas.
         # The generated tool_search helper is intentionally not subject to the

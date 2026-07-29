@@ -37,12 +37,13 @@ from deerflow.agents.lead_agent.agent import build_middlewares
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.thread_state import ThreadState
 from deerflow.config.agents_config import AGENT_NAME_PATTERN
-from deerflow.config.app_config import get_app_config, reload_app_config
+from deerflow.config.app_config import AppConfig, get_app_config, reload_app_config
 from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig, get_extensions_config, reload_extensions_config
 from deerflow.config.paths import get_paths
 from deerflow.models import create_chat_model
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.skills.storage import get_or_new_skill_storage
+from deerflow.subagents.delegation import DelegationPolicy
 from deerflow.tools.builtins.tool_search import assemble_deferred_tools
 from deerflow.tracing import (
     PhoenixRootContext,
@@ -245,7 +246,16 @@ class DeerFlowClient:
         subagent_enabled = cfg.get("subagent_enabled", False)
         max_concurrent_subagents = cfg.get("max_concurrent_subagents", 3)
 
-        tools = self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled)
+        delegation_policy = DelegationPolicy(
+            tool_groups=None,
+            available_skills=frozenset(self._available_skills) if self._available_skills is not None else None,
+        )
+        tools = self._get_tools(
+            model_name=model_name,
+            subagent_enabled=subagent_enabled,
+            delegation_policy=delegation_policy,
+            app_config=self._app_config,
+        )
         final_tools, deferred_setup = assemble_deferred_tools(tools, enabled=self._app_config.tool_search.enabled)
         kwargs: dict[str, Any] = {
             # attach_tracing=False because ``stream()`` injects tracing
@@ -285,11 +295,22 @@ class DeerFlowClient:
         logger.info("Agent created: agent_name=%s, model=%s, thinking=%s", self._agent_name, model_name, thinking_enabled)
 
     @staticmethod
-    def _get_tools(*, model_name: str | None, subagent_enabled: bool):
+    def _get_tools(
+        *,
+        model_name: str | None,
+        subagent_enabled: bool,
+        delegation_policy: DelegationPolicy,
+        app_config: AppConfig,
+    ):
         """Lazy import to avoid circular dependency at module level."""
         from deerflow.tools import get_available_tools
 
-        return get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled)
+        return get_available_tools(
+            model_name=model_name,
+            subagent_enabled=subagent_enabled,
+            delegation_policy=delegation_policy,
+            app_config=app_config,
+        )
 
     @staticmethod
     def _serialize_tool_calls(tool_calls) -> list[dict]:
@@ -639,7 +660,7 @@ class DeerFlowClient:
         self._ensure_agent(config)
 
         state: dict[str, Any] = {"messages": [HumanMessage(content=message)]}
-        context = {"thread_id": thread_id}
+        context = {"thread_id": thread_id, "app_config": self._app_config}
         if self._agent_name:
             context["agent_name"] = self._agent_name
 
