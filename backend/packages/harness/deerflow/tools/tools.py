@@ -54,6 +54,15 @@ class ToolCatalogSnapshot:
         return _deduplicate_tools(projected)
 
 
+@dataclass(frozen=True, slots=True)
+class ParentToolSet:
+    """One resolved parent tool set and the hashes required by agent caches."""
+
+    tools: tuple[BaseTool, ...]
+    parent_policy_fingerprint: str
+    tool_catalog_fingerprint: str
+
+
 def _is_host_bash_tool(tool: object) -> bool:
     """Return True if the tool config represents a host-bash execution surface."""
     group = getattr(tool, "group", None)
@@ -168,7 +177,7 @@ def load_available_tool_catalog(
             if extensions_config.get_enabled_mcp_servers():
                 from deerflow.mcp.cache import get_cached_mcp_tools
 
-                mcp_tools = list(get_cached_mcp_tools())
+                mcp_tools = list(get_cached_mcp_tools(strict=True) if strict else get_cached_mcp_tools())
                 for mcp_tool in mcp_tools:
                     tag_mcp_tool(mcp_tool)
         except ImportError as exc:
@@ -258,3 +267,45 @@ def get_available_tools(
         tools.append(build_task_tool(delegation_policy))
         logger.info("Including subagent tools (task)")
     return _deduplicate_tools(tools)
+
+
+def load_parent_tool_set(
+    *,
+    model_name: str | None,
+    subagent_enabled: bool,
+    app_config: AppConfig,
+    delegation_policy: "DelegationPolicy",
+) -> ParentToolSet:
+    """Load and fingerprint the exact tool catalog retained by a parent agent."""
+    from deerflow.agents.lead_agent.prompt import get_enabled_skills_for_config
+    from deerflow.config.app_config import get_app_config_generation
+    from deerflow.mcp.cache import get_mcp_catalog_generation
+    from deerflow.tools.catalog_fingerprint import (
+        fingerprint_parent_policy,
+        fingerprint_tool_catalog,
+    )
+
+    catalog = load_available_tool_catalog(
+        include_mcp=True,
+        model_name=model_name,
+        app_config=app_config,
+        strict=False,
+    )
+    tools = catalog.project(delegation_policy.tool_groups)
+    if subagent_enabled:
+        from deerflow.tools.builtins.task_tool import build_task_tool
+
+        tools.append(build_task_tool(delegation_policy))
+    tools = _deduplicate_tools(tools)
+    skills = tuple(get_enabled_skills_for_config(app_config))
+    return ParentToolSet(
+        tools=tuple(tools),
+        parent_policy_fingerprint=fingerprint_parent_policy(delegation_policy),
+        tool_catalog_fingerprint=fingerprint_tool_catalog(
+            catalog=catalog,
+            skills=skills,
+            app_config_generation=get_app_config_generation(),
+            mcp_catalog_generation=get_mcp_catalog_generation(),
+            deferred_enabled=app_config.tool_search.enabled,
+        ),
+    )

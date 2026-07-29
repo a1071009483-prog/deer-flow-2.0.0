@@ -80,6 +80,9 @@ class ResolvedDelegation:
     request: DelegationRequest
     effective_skills: tuple[str, ...] | None
     tools: tuple[BaseTool, ...]
+    parent_policy_fingerprint: str
+    delegation_decision_fingerprint: str
+    tool_catalog_fingerprint: str
 
 
 def _load_enabled_skills(app_config: AppConfig) -> list[Skill]:
@@ -181,9 +184,39 @@ def resolve_delegation(
         selected_skills = [skill for skill in all_skills if skill.name in selected_names]
     effective_tools = filter_tools_by_skill_allowed_tools(projected_tools, selected_skills)
 
+    try:
+        from deerflow.config.app_config import get_app_config_generation
+        from deerflow.mcp.cache import get_mcp_catalog_generation
+        from deerflow.tools.catalog_fingerprint import (
+            fingerprint_delegation_decision,
+            fingerprint_parent_policy,
+            fingerprint_tool_catalog,
+        )
+
+        parent_policy_fingerprint = fingerprint_parent_policy(parent_policy)
+        delegation_decision_fingerprint = fingerprint_delegation_decision(
+            parent_policy_fingerprint=parent_policy_fingerprint,
+            request=request,
+            effective_skills=effective_skills,
+            effective_tools=effective_tools,
+            catalog=catalog,
+        )
+        tool_catalog_fingerprint = fingerprint_tool_catalog(
+            catalog=catalog,
+            skills=all_skills,
+            app_config_generation=get_app_config_generation(),
+            mcp_catalog_generation=get_mcp_catalog_generation(),
+            deferred_enabled=bool(getattr(getattr(app_config, "tool_search", None), "enabled", False)),
+        )
+    except Exception as exc:
+        raise DelegationPolicyError("Delegation fingerprint resolution failed") from exc
+
     return ResolvedDelegation(
         parent_policy=parent_policy,
         request=request,
         effective_skills=effective_skills,
         tools=tuple(effective_tools),
+        parent_policy_fingerprint=parent_policy_fingerprint,
+        delegation_decision_fingerprint=delegation_decision_fingerprint,
+        tool_catalog_fingerprint=tool_catalog_fingerprint,
     )

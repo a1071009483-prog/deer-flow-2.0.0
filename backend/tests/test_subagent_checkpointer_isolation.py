@@ -70,6 +70,9 @@ def _setup_executor_module():
                 request=request,
                 effective_skills=None,
                 tools=tuple(tools),
+                parent_policy_fingerprint="sha256:test-parent",
+                delegation_decision_fingerprint="sha256:test-decision",
+                tool_catalog_fingerprint="sha256:test-catalog",
             )
             super().__init__(config=config, resolved_delegation=resolved, **kwargs)
 

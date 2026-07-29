@@ -88,6 +88,9 @@ def _resolve_for_test(parent_policy: DelegationPolicy, request: DelegationReques
         request=request,
         effective_skills=intersect_allowlists(parent_policy.available_skills, request.requested_skills),
         tools=(),
+        parent_policy_fingerprint="sha256:test-parent",
+        delegation_decision_fingerprint="sha256:test-decision",
+        tool_catalog_fingerprint="sha256:test-catalog",
     )
 
 

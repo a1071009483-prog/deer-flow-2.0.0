@@ -120,6 +120,9 @@ def _setup_executor_classes():
                 request=request,
                 effective_skills=tuple(config.skills) if config.skills is not None else None,
                 tools=tuple(tools),
+                parent_policy_fingerprint="sha256:test-parent",
+                delegation_decision_fingerprint="sha256:test-decision",
+                tool_catalog_fingerprint="sha256:test-catalog",
             )
             super().__init__(config=config, resolved_delegation=resolved, **kwargs)
 
@@ -299,6 +302,9 @@ class TestAgentConstruction:
             request=DelegationRequest(subagent_type="test-agent"),
             effective_skills=("resolved-skill",),
             tools=(resolved_tool,),
+            parent_policy_fingerprint="sha256:parent",
+            delegation_decision_fingerprint="sha256:decision",
+            tool_catalog_fingerprint="sha256:catalog",
         )
 
         executor = classes["ProductionSubagentExecutor"](
@@ -310,6 +316,9 @@ class TestAgentConstruction:
         assert executor.resolved_delegation is resolved
         assert executor.tools == [resolved_tool]
         assert executor._base_tools == [resolved_tool]
+        assert executor.parent_policy_fingerprint == "sha256:parent"
+        assert executor.delegation_decision_fingerprint == "sha256:decision"
+        assert executor.tool_catalog_fingerprint == "sha256:catalog"
 
     def test_constructor_rejects_mismatched_resolved_subagent(self, classes, base_config):
         from deerflow.subagents.delegation import (
@@ -324,6 +333,9 @@ class TestAgentConstruction:
             request=DelegationRequest(subagent_type="different-agent"),
             effective_skills=None,
             tools=(),
+            parent_policy_fingerprint="sha256:parent",
+            delegation_decision_fingerprint="sha256:decision",
+            tool_catalog_fingerprint="sha256:catalog",
         )
 
         with pytest.raises(DelegationPolicyError, match="does not match"):

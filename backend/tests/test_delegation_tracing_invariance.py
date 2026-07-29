@@ -35,6 +35,8 @@ def present_files(path: str) -> str:
 
 def _skill(name: str) -> Skill:
     skill_dir = Path("/tmp") / name
+    skill_dir.mkdir(exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
     return Skill(
         name=name,
         description=name,

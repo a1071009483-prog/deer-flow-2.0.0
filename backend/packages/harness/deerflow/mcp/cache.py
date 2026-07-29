@@ -1,6 +1,7 @@
 """Cache for MCP tools to avoid repeated loading."""
 
 import asyncio
+import itertools
 import logging
 import os
 
@@ -12,6 +13,13 @@ _mcp_tools_cache: list[BaseTool] | None = None
 _cache_initialized = False
 _initialization_lock = asyncio.Lock()
 _config_mtime: float | None = None  # Track config file modification time
+_mcp_catalog_generation = 0
+_mcp_catalog_generation_counter = itertools.count(1)
+
+
+def get_mcp_catalog_generation() -> int:
+    """Return the process-local monotonic MCP tool-cache revision."""
+    return _mcp_catalog_generation
 
 
 def _get_config_mtime() -> float | None:
@@ -61,7 +69,7 @@ async def initialize_mcp_tools() -> list[BaseTool]:
     Returns:
         List of LangChain tools from all enabled MCP servers.
     """
-    global _mcp_tools_cache, _cache_initialized, _config_mtime
+    global _mcp_tools_cache, _cache_initialized, _config_mtime, _mcp_catalog_generation
 
     async with _initialization_lock:
         if _cache_initialized:
@@ -74,12 +82,13 @@ async def initialize_mcp_tools() -> list[BaseTool]:
         _mcp_tools_cache = await get_mcp_tools()
         _cache_initialized = True
         _config_mtime = _get_config_mtime()  # Record config file mtime
+        _mcp_catalog_generation = next(_mcp_catalog_generation_counter)
         logger.info(f"MCP tools initialized: {len(_mcp_tools_cache)} tool(s) loaded (config mtime: {_config_mtime})")
 
         return _mcp_tools_cache
 
 
-def get_cached_mcp_tools() -> list[BaseTool]:
+def get_cached_mcp_tools(*, strict: bool = False) -> list[BaseTool]:
     """Get cached MCP tools with lazy initialization.
 
     If tools are not initialized, automatically initializes them.
@@ -121,9 +130,13 @@ def get_cached_mcp_tools() -> list[BaseTool]:
                 asyncio.run(initialize_mcp_tools())
             except Exception:
                 logger.exception("Failed to lazy-initialize MCP tools")
+                if strict:
+                    raise
                 return []
         except Exception:
             logger.exception("Failed to lazy-initialize MCP tools")
+            if strict:
+                raise
             return []
 
     return _mcp_tools_cache or []
@@ -136,10 +149,11 @@ def reset_mcp_tools_cache() -> None:
     Also closes all persistent MCP sessions so they are recreated on
     the next tool load.
     """
-    global _mcp_tools_cache, _cache_initialized, _config_mtime
+    global _mcp_tools_cache, _cache_initialized, _config_mtime, _mcp_catalog_generation
     _mcp_tools_cache = None
     _cache_initialized = False
     _config_mtime = None
+    _mcp_catalog_generation = next(_mcp_catalog_generation_counter)
 
     # Close persistent sessions – they will be recreated by the next
     # get_mcp_tools() call with the (possibly updated) connection config.

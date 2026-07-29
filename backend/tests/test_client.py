@@ -19,11 +19,20 @@ from app.gateway.routers.skills import SkillInstallResponse, SkillResponse, Skil
 from app.gateway.routers.uploads import UploadResponse
 from deerflow.client import DeerFlowClient
 from deerflow.config.paths import Paths
+from deerflow.tools.tools import ParentToolSet
 from deerflow.uploads.manager import PathTraversalError
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+def _empty_parent_tool_set() -> ParentToolSet:
+    return ParentToolSet(
+        tools=(),
+        parent_policy_fingerprint="sha256:test-parent",
+        tool_catalog_fingerprint="sha256:test-catalog",
+    )
 
 
 @pytest.fixture
@@ -912,7 +921,7 @@ class TestEnsureAgent:
             patch("deerflow.client.create_agent", return_value=mock_agent),
             patch("deerflow.client.build_middlewares", return_value=[]) as mock_build_middlewares,
             patch("deerflow.client.apply_prompt_template", return_value="prompt") as mock_apply_prompt,
-            patch.object(client, "_get_tools", return_value=[]),
+            patch.object(client, "_get_tools", return_value=_empty_parent_tool_set()),
             patch("deerflow.runtime.checkpointer.get_checkpointer", return_value=MagicMock()),
         ):
             client._agent_name = "custom-agent"
@@ -937,7 +946,7 @@ class TestEnsureAgent:
             patch("deerflow.client.create_agent", return_value=mock_agent) as mock_create_agent,
             patch("deerflow.client.build_middlewares", return_value=[]),
             patch("deerflow.client.apply_prompt_template", return_value="prompt"),
-            patch.object(client, "_get_tools", return_value=[]),
+            patch.object(client, "_get_tools", return_value=_empty_parent_tool_set()),
             patch("deerflow.runtime.checkpointer.get_checkpointer", return_value=mock_checkpointer),
         ):
             client._ensure_agent(config)
@@ -962,7 +971,7 @@ class TestEnsureAgent:
             patch("deerflow.client.create_agent", return_value=mock_agent) as mock_create_agent,
             patch("deerflow.client.build_middlewares", side_effect=fake_build_middlewares),
             patch("deerflow.client.apply_prompt_template", return_value="prompt"),
-            patch.object(client, "_get_tools", return_value=[]),
+            patch.object(client, "_get_tools", return_value=_empty_parent_tool_set()),
             patch("deerflow.runtime.checkpointer.get_checkpointer", return_value=MagicMock()),
         ):
             client._ensure_agent(config)
@@ -981,7 +990,7 @@ class TestEnsureAgent:
             patch("deerflow.client.create_agent", return_value=mock_agent) as mock_create_agent,
             patch("deerflow.client.build_middlewares", return_value=[]),
             patch("deerflow.client.apply_prompt_template", return_value="prompt"),
-            patch.object(client, "_get_tools", return_value=[]),
+            patch.object(client, "_get_tools", return_value=_empty_parent_tool_set()),
             patch("deerflow.runtime.checkpointer.get_checkpointer", return_value=None),
         ):
             client._ensure_agent(config)
@@ -991,14 +1000,21 @@ class TestEnsureAgent:
     def test_reuses_agent_same_config(self, client):
         """_ensure_agent does not recreate if config key unchanged."""
         mock_agent = MagicMock()
-        client._agent = mock_agent
-        client._agent_config_key = (None, True, False, False, None, None)
-
         config = client._get_runnable_config("t1")
-        client._ensure_agent(config)
 
-        # Should still be the same mock — no recreation
+        with (
+            patch("deerflow.client.create_chat_model"),
+            patch("deerflow.client.create_agent", return_value=mock_agent) as create_agent,
+            patch("deerflow.client.build_middlewares", return_value=[]),
+            patch("deerflow.client.apply_prompt_template", return_value="prompt"),
+            patch.object(client, "_get_tools", return_value=_empty_parent_tool_set()),
+            patch("deerflow.runtime.checkpointer.get_checkpointer", return_value=None),
+        ):
+            client._ensure_agent(config)
+            client._ensure_agent(config)
+
         assert client._agent is mock_agent
+        create_agent.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1959,7 +1975,7 @@ class TestScenarioAgentRecreation:
             patch("deerflow.client.create_agent", side_effect=fake_create_agent),
             patch("deerflow.client.build_middlewares", return_value=[]),
             patch("deerflow.client.apply_prompt_template", return_value="prompt"),
-            patch.object(client, "_get_tools", return_value=[]),
+            patch.object(client, "_get_tools", return_value=_empty_parent_tool_set()),
             patch("deerflow.runtime.checkpointer.get_checkpointer", return_value=MagicMock()),
         ):
             client._ensure_agent(config_a)
@@ -1987,7 +2003,7 @@ class TestScenarioAgentRecreation:
             patch("deerflow.client.create_agent", side_effect=fake_create_agent),
             patch("deerflow.client.build_middlewares", return_value=[]),
             patch("deerflow.client.apply_prompt_template", return_value="prompt"),
-            patch.object(client, "_get_tools", return_value=[]),
+            patch.object(client, "_get_tools", return_value=_empty_parent_tool_set()),
             patch("deerflow.runtime.checkpointer.get_checkpointer", return_value=MagicMock()),
         ):
             client._ensure_agent(config)
@@ -2012,7 +2028,7 @@ class TestScenarioAgentRecreation:
             patch("deerflow.client.create_agent", side_effect=fake_create_agent),
             patch("deerflow.client.build_middlewares", return_value=[]),
             patch("deerflow.client.apply_prompt_template", return_value="prompt"),
-            patch.object(client, "_get_tools", return_value=[]),
+            patch.object(client, "_get_tools", return_value=_empty_parent_tool_set()),
             patch("deerflow.runtime.checkpointer.get_checkpointer", return_value=MagicMock()),
         ):
             client._ensure_agent(config)

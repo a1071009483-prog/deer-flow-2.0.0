@@ -1,4 +1,5 @@
 import hashlib
+import itertools
 import logging
 import os
 from collections.abc import Mapping
@@ -404,6 +405,8 @@ _app_config_mtime: float | None = None
 _ConfigSignature = tuple[float | None, int | None, str | None]
 _app_config_signature: _ConfigSignature | None = None
 _app_config_is_custom = False
+_app_config_generation = 0
+_app_config_generation_counter = itertools.count(1)
 _current_app_config: ContextVar[AppConfig | None] = ContextVar("deerflow_current_app_config", default=None)
 _current_app_config_stack: ContextVar[tuple[AppConfig | None, ...]] = ContextVar("deerflow_current_app_config_stack", default=())
 
@@ -436,7 +439,7 @@ def _get_config_signature(config_path: Path) -> _ConfigSignature | None:
 
 def _load_and_cache_app_config(config_path: str | None = None) -> AppConfig:
     """Load config from disk and refresh cache metadata."""
-    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom
+    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom, _app_config_generation
 
     resolved_path = AppConfig.resolve_config_path(config_path)
     _app_config = AppConfig.from_file(str(resolved_path))
@@ -444,7 +447,13 @@ def _load_and_cache_app_config(config_path: str | None = None) -> AppConfig:
     _app_config_mtime = _get_config_mtime(resolved_path)
     _app_config_signature = _get_config_signature(resolved_path)
     _app_config_is_custom = False
+    _app_config_generation = next(_app_config_generation_counter)
     return _app_config
+
+
+def get_app_config_generation() -> int:
+    """Return the process-local monotonic AppConfig cache revision."""
+    return _app_config_generation
 
 
 def get_app_config() -> AppConfig:
@@ -505,12 +514,13 @@ def reset_app_config() -> None:
     `get_app_config()` to reload from file. Useful for testing
     or when switching between different configurations.
     """
-    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom
+    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom, _app_config_generation
     _app_config = None
     _app_config_path = None
     _app_config_mtime = None
     _app_config_signature = None
     _app_config_is_custom = False
+    _app_config_generation = next(_app_config_generation_counter)
 
 
 def set_app_config(config: AppConfig) -> None:
@@ -521,12 +531,13 @@ def set_app_config(config: AppConfig) -> None:
     Args:
         config: The AppConfig instance to use.
     """
-    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom
+    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom, _app_config_generation
     _app_config = config
     _app_config_path = None
     _app_config_mtime = None
     _app_config_signature = None
     _app_config_is_custom = True
+    _app_config_generation = next(_app_config_generation_counter)
 
 
 def peek_current_app_config() -> AppConfig | None:

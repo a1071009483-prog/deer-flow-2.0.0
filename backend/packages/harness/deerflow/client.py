@@ -229,18 +229,6 @@ class DeerFlowClient:
     def _ensure_agent(self, config: RunnableConfig):
         """Create (or recreate) the agent when config-dependent params change."""
         cfg = config.get("configurable", {})
-        key = (
-            cfg.get("model_name"),
-            cfg.get("thinking_enabled"),
-            cfg.get("is_plan_mode"),
-            cfg.get("subagent_enabled"),
-            self._agent_name,
-            frozenset(self._available_skills) if self._available_skills is not None else None,
-        )
-
-        if self._agent is not None and self._agent_config_key == key:
-            return
-
         thinking_enabled = cfg.get("thinking_enabled", True)
         model_name = cfg.get("model_name")
         subagent_enabled = cfg.get("subagent_enabled", False)
@@ -250,12 +238,32 @@ class DeerFlowClient:
             tool_groups=None,
             available_skills=frozenset(self._available_skills) if self._available_skills is not None else None,
         )
-        tools = self._get_tools(
+        loaded_tool_set = self._get_tools(
             model_name=model_name,
             subagent_enabled=subagent_enabled,
             delegation_policy=delegation_policy,
             app_config=self._app_config,
         )
+        from deerflow.tools.tools import ParentToolSet
+
+        if not isinstance(loaded_tool_set, ParentToolSet):
+            raise TypeError("DeerFlowClient._get_tools() must return a fingerprinted ParentToolSet")
+        tools = list(loaded_tool_set.tools)
+        parent_policy_fingerprint = loaded_tool_set.parent_policy_fingerprint
+        tool_catalog_fingerprint = loaded_tool_set.tool_catalog_fingerprint
+
+        key = (
+            model_name,
+            thinking_enabled,
+            cfg.get("is_plan_mode"),
+            subagent_enabled,
+            self._agent_name,
+            parent_policy_fingerprint,
+            tool_catalog_fingerprint,
+        )
+        if self._agent is not None and self._agent_config_key == key:
+            return
+
         final_tools, deferred_setup = assemble_deferred_tools(tools, enabled=self._app_config.tool_search.enabled)
         kwargs: dict[str, Any] = {
             # attach_tracing=False because ``stream()`` injects tracing
@@ -303,9 +311,9 @@ class DeerFlowClient:
         app_config: AppConfig,
     ):
         """Lazy import to avoid circular dependency at module level."""
-        from deerflow.tools import get_available_tools
+        from deerflow.tools.tools import load_parent_tool_set
 
-        return get_available_tools(
+        return load_parent_tool_set(
             model_name=model_name,
             subagent_enabled=subagent_enabled,
             delegation_policy=delegation_policy,

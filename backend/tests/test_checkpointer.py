@@ -21,6 +21,13 @@ from deerflow.runtime.checkpointer import get_checkpointer, reset_checkpointer
 from deerflow.runtime.checkpointer.provider import POSTGRES_INSTALL
 from deerflow.runtime.store import get_store, reset_store
 from deerflow.runtime.store.provider import POSTGRES_STORE_INSTALL
+from deerflow.tools.tools import ParentToolSet
+
+_EMPTY_PARENT_TOOL_SET = ParentToolSet(
+    tools=(),
+    parent_policy_fingerprint="sha256:test-parent",
+    tool_catalog_fingerprint="sha256:test-catalog",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -749,7 +756,7 @@ class TestClientCheckpointerFallback:
             patch("deerflow.client.create_chat_model", return_value=MagicMock()),
             patch("deerflow.client.build_middlewares", return_value=[]),
             patch("deerflow.client.apply_prompt_template", return_value=""),
-            patch("deerflow.client.DeerFlowClient._get_tools", return_value=[]),
+            patch("deerflow.client.DeerFlowClient._get_tools", return_value=_EMPTY_PARENT_TOOL_SET),
         ):
             client = DeerFlowClient(checkpointer=None)
             config = client._get_runnable_config("test-thread")
@@ -783,7 +790,7 @@ class TestClientCheckpointerFallback:
             patch("deerflow.client.create_chat_model", return_value=MagicMock()),
             patch("deerflow.client.build_middlewares", return_value=[]),
             patch("deerflow.client.apply_prompt_template", return_value=""),
-            patch("deerflow.client.DeerFlowClient._get_tools", return_value=[]),
+            patch("deerflow.client.DeerFlowClient._get_tools", return_value=_EMPTY_PARENT_TOOL_SET),
         ):
             client = DeerFlowClient(checkpointer=explicit_cp)
             config = client._get_runnable_config("test-thread")

@@ -70,6 +70,8 @@ def test_policy_and_request_normalize_duplicates_and_order():
 
 def _skill(tmp_path: Path, name: str, allowed_tools: list[str] | None = None) -> Skill:
     skill_dir = tmp_path / name
+    skill_dir.mkdir(exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
     return Skill(
         name=name,
         description=name,
@@ -123,6 +125,9 @@ def test_group_policy_filters_only_configured_tools(monkeypatch, tmp_path, catal
 
     assert [tool.name for tool in resolved.tools] == ["web_search", "present_files"]
     assert resolved.effective_skills is None
+    assert resolved.parent_policy_fingerprint.startswith("sha256:")
+    assert resolved.delegation_decision_fingerprint.startswith("sha256:")
+    assert resolved.tool_catalog_fingerprint.startswith("sha256:")
 
 
 def test_skill_policy_filters_the_group_projected_catalog(monkeypatch, tmp_path, catalog):

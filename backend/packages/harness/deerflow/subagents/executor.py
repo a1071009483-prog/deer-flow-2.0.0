@@ -293,6 +293,9 @@ class SubagentExecutor:
         if config.name != resolved_delegation.request.subagent_type:
             raise DelegationPolicyError("Resolved delegation does not match subagent config")
         self.resolved_delegation = resolved_delegation
+        self.parent_policy_fingerprint = resolved_delegation.parent_policy_fingerprint
+        self.delegation_decision_fingerprint = resolved_delegation.delegation_decision_fingerprint
+        self.tool_catalog_fingerprint = resolved_delegation.tool_catalog_fingerprint
         self.app_config = app_config
         self.parent_model = parent_model
         # Resolve eagerly only when it does not require loading config.yaml; otherwise defer
