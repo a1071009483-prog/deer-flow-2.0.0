@@ -21,10 +21,8 @@ execute, which would make the test flaky; their attachment + ordering is locked 
 tests/test_tool_error_handling_middleware.py instead.)
 """
 
-import asyncio
-
 from langchain.agents import create_agent
-from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool as as_tool
 
@@ -55,7 +53,7 @@ def mcp_other(x: str) -> str:
 def test_subagent_deferral_recipe_hides_then_promotes():
     bound: list[list[str]] = []
 
-    class RecordingModel(GenericFakeChatModel):
+    class RecordingModel(FakeMessagesListChatModel):
         def bind_tools(self, tools, **kwargs):
             bound.append([getattr(t, "name", None) for t in tools])
             return self
@@ -74,7 +72,7 @@ def test_subagent_deferral_recipe_hides_then_promotes():
 
     turn1 = AIMessage(content="", tool_calls=[{"name": "tool_search", "args": {"query": "select:mcp_calc"}, "id": "c1", "type": "tool_call"}])
     turn2 = AIMessage(content="done")
-    model = RecordingModel(messages=iter([turn1, turn2]))
+    model = RecordingModel(responses=[turn1, turn2])
 
     # The middleware DeferredToolFilterMiddleware is exactly what
     # build_subagent_runtime_middlewares attaches for this setup (locked by
@@ -88,7 +86,7 @@ def test_subagent_deferral_recipe_hides_then_promotes():
         state_schema=ThreadState,
     )
 
-    result = asyncio.run(graph.ainvoke({"messages": [SystemMessage(content=section), HumanMessage(content="use the deferred calculator")]}))
+    result = graph.invoke({"messages": [SystemMessage(content=section), HumanMessage(content="use the deferred calculator")]})
 
     assert len(bound) >= 2, f"expected >=2 model binds, got {bound}"
     # Turn 1: both deferred MCP tools hidden from the subagent's model binding.
@@ -115,7 +113,7 @@ def test_subagent_builder_emits_working_deferred_filter():
 
     bound: list[list[str]] = []
 
-    class RecordingModel(GenericFakeChatModel):
+    class RecordingModel(FakeMessagesListChatModel):
         def bind_tools(self, tools, **kwargs):
             bound.append([getattr(t, "name", None) for t in tools])
             return self
@@ -149,7 +147,7 @@ def test_subagent_builder_emits_working_deferred_filter():
 
     turn1 = AIMessage(content="", tool_calls=[{"name": "tool_search", "args": {"query": "select:mcp_calc"}, "id": "c1", "type": "tool_call"}])
     turn2 = AIMessage(content="done")
-    model = RecordingModel(messages=iter([turn1, turn2]))
+    model = RecordingModel(responses=[turn1, turn2])
 
     # Run only the builder-produced filter (the component under test). The other
     # runtime middlewares need sandbox/thread infra to *execute*, so running the
@@ -162,7 +160,7 @@ def test_subagent_builder_emits_working_deferred_filter():
         system_prompt=None,
         state_schema=ThreadState,
     )
-    result = asyncio.run(graph.ainvoke({"messages": [SystemMessage(content=section), HumanMessage(content="use the deferred calculator")]}))
+    result = graph.invoke({"messages": [SystemMessage(content=section), HumanMessage(content="use the deferred calculator")]})
 
     assert len(bound) >= 2, f"expected >=2 model binds, got {bound}"
     # Turn 1: both deferred MCP tools hidden - the builder-produced filter is active.
