@@ -104,9 +104,12 @@ def test_subagent_loading_requires_explicit_delegation_policy(mock_bash, mock_cf
     """There is no unrestricted default task tool."""
     mock_cfg.return_value = _make_minimal_config([])
 
-    with patch("deerflow.tools.tools.BUILTIN_TOOLS", []), pytest.raises(
-        DelegationPolicyError,
-        match="delegation_policy is required",
+    with (
+        patch("deerflow.tools.tools.BUILTIN_TOOLS", []),
+        pytest.raises(
+            DelegationPolicyError,
+            match="delegation_policy is required",
+        ),
     ):
         get_available_tools(include_mcp=False, subagent_enabled=True, app_config=mock_cfg.return_value)
 

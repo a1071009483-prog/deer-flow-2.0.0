@@ -27,7 +27,7 @@ from deerflow.sandbox.tools import (
     str_replace_tool,
     write_file_tool,
 )
-from deerflow.subagents.delegation import DelegationPolicy
+from deerflow.subagents.delegation import DelegationParentContext, DelegationPolicy
 from deerflow.tools.builtins.present_file_tool import present_file_tool
 from deerflow.tools.builtins.setup_agent_tool import setup_agent
 from deerflow.tools.builtins.task_tool import build_task_tool
@@ -48,7 +48,7 @@ def _make_runtime(context: dict) -> ToolRuntime:
     )
 
 
-_TASK_TOOL = build_task_tool(DelegationPolicy(tool_groups=None, available_skills=None))
+_TASK_TOOL = build_task_tool(DelegationParentContext(policy=DelegationPolicy(tool_groups=None, available_skills=None)))
 
 
 _TOOL_CASES = [

@@ -18,9 +18,7 @@ if TYPE_CHECKING:
 _POLICY_VERSION = 1
 _CATALOG_VERSION = 1
 _DEFERRED_CATALOG_REVISION = 1
-_SCHEMA_VALUE_KEYS_TO_DIGEST = frozenset(
-    {"const", "default", "description", "enum", "example", "examples", "title"}
-)
+_SCHEMA_VALUE_KEYS_TO_DIGEST = frozenset({"const", "default", "description", "enum", "example", "examples", "title"})
 
 
 def _normalized_names(values: Iterable[str] | None) -> list[str] | None:
@@ -45,10 +43,7 @@ def _fingerprint(value: Mapping[str, Any]) -> str:
 
 def _json_safe_schema_value(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {
-            str(key): _json_safe_schema_value(child)
-            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
-        }
+        return {str(key): _json_safe_schema_value(child) for key, child in sorted(value.items(), key=lambda item: str(item[0]))}
     if isinstance(value, (list, tuple)):
         return [_json_safe_schema_value(child) for child in value]
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -63,11 +58,7 @@ def _sanitize_schema(value: Any) -> Any:
         for key, child in sorted(value.items(), key=lambda item: str(item[0])):
             normalized_key = str(key)
             if normalized_key in _SCHEMA_VALUE_KEYS_TO_DIGEST:
-                sanitized[normalized_key] = {
-                    "value_digest": _fingerprint(
-                        {"value": _json_safe_schema_value(child)}
-                    )
-                }
+                sanitized[normalized_key] = {"value_digest": _fingerprint({"value": _json_safe_schema_value(child)})}
             else:
                 sanitized[normalized_key] = _sanitize_schema(child)
         return sanitized

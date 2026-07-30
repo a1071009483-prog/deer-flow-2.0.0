@@ -1,28 +1,16 @@
 """Caches retaining policy-bound tools must include policy/catalog revisions."""
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from support.client_factory import make_client_stub
 
 from deerflow.client import DeerFlowClient
 from deerflow.tools.tools import ParentToolSet
 
 
 def _client() -> DeerFlowClient:
-    client = object.__new__(DeerFlowClient)
-    client._agent = None
-    client._agent_config_key = None
-    client._agent_name = None
-    client._available_skills = None
-    client._middlewares = []
-    client._checkpointer = None
-    client._app_config = SimpleNamespace(tool_search=SimpleNamespace(enabled=False))
-    client._model_name = None
-    client._thinking_enabled = True
-    client._plan_mode = False
-    client._subagent_enabled = False
-    return client
+    return make_client_stub()
 
 
 def _tool_set(*, policy="sha256:policy", catalog="sha256:catalog") -> ParentToolSet:

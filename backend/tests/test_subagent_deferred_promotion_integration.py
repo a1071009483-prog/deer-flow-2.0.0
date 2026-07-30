@@ -21,6 +21,7 @@ execute, which would make the test flaky; their attachment + ordering is locked 
 tests/test_tool_error_handling_middleware.py instead.)
 """
 
+import pytest
 from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -30,6 +31,14 @@ from deerflow.agents.middlewares.deferred_tool_filter_middleware import Deferred
 from deerflow.agents.thread_state import ThreadState
 from deerflow.tools.builtins.tool_search import assemble_deferred_tools, get_deferred_tools_prompt_section
 from deerflow.tools.mcp_metadata import tag_mcp_tool
+
+
+@pytest.fixture(autouse=True)
+def _disable_langsmith_tracing(monkeypatch: pytest.MonkeyPatch):
+    """Keep these non-tracing graph integration tests context-neutral."""
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+    monkeypatch.setenv("LANGCHAIN_TRACING", "false")
 
 
 @as_tool

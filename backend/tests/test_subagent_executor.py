@@ -17,7 +17,7 @@ import asyncio
 import importlib
 import sys
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import copy_context
 from datetime import datetime
 from pathlib import Path
@@ -2399,11 +2399,19 @@ class TestSubagentTracingWiring:
         langsmith_enabled,
         task_count,
     ):
+        # Keep the matrix independent of process-level tracing defaults. The
+        # ``langsmith_enabled`` parameter below is the only source of a
+        # LangSmith callback for this test.
+        monkeypatch.setenv("LANGSMITH_TRACING", "false")
+        monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+        monkeypatch.setenv("LANGCHAIN_TRACING", "false")
+
         from langchain.agents import create_agent
         from langchain_core.language_models import BaseChatModel
         from langchain_core.messages import AIMessage, HumanMessage
         from langchain_core.outputs import ChatGeneration, ChatResult
         from langchain_core.tools import StructuredTool, tool
+        from langsmith.run_helpers import tracing_context
         from openinference.instrumentation.langchain import LangChainInstrumentor
         from opentelemetry import trace
         from opentelemetry.sdk.trace import TracerProvider
@@ -2590,40 +2598,42 @@ class TestSubagentTracingWiring:
         try:
             phoenix.ensure_phoenix_tracing_initialized(config)
             assert instrumentor._is_instrumented_by_opentelemetry
-            if entry_mode == "gateway":
-                record = RunRecord(
-                    run_id=f"task4-{entry_mode}-{langsmith_enabled}",
-                    thread_id=f"thread-task4-{entry_mode}-{langsmith_enabled}",
-                    assistant_id="lead-agent",
-                    status=RunStatus.pending,
-                    on_disconnect=DisconnectMode.cancel,
-                )
-                asyncio.run(
-                    run_agent(
-                        _WorkerBridge(),
-                        _WorkerRunManager(),
-                        record,
-                        ctx=RunContext(checkpointer=None),
-                        agent_factory=lambda config: lead_agent,
-                        graph_input={"messages": [HumanMessage(content="delegate once")]},
-                        config={
-                            "callbacks": list(tracing_callbacks),
-                            "configurable": {"thread_id": record.thread_id},
-                        },
+            langsmith_scope = nullcontext() if langsmith_enabled else tracing_context(parent=False, enabled=False)
+            with langsmith_scope:
+                if entry_mode == "gateway":
+                    record = RunRecord(
+                        run_id=f"task4-{entry_mode}-{langsmith_enabled}",
+                        thread_id=f"thread-task4-{entry_mode}-{langsmith_enabled}",
+                        assistant_id="lead-agent",
+                        status=RunStatus.pending,
+                        on_disconnect=DisconnectMode.cancel,
                     )
-                )
-            else:
-                caller_span_ids: list[int] = []
-                with provider.get_tracer("deerflow.tests.task4.embedded").start_as_current_span("embedded-caller") as caller_span:
-                    _invoke_embedded_client(
-                        monkeypatch,
-                        lead_agent,
-                        f"task4-{entry_mode}-{langsmith_enabled}",
-                        langsmith_tracer,
-                        caller_span_ids,
+                    asyncio.run(
+                        run_agent(
+                            _WorkerBridge(),
+                            _WorkerRunManager(),
+                            record,
+                            ctx=RunContext(checkpointer=None),
+                            agent_factory=lambda config: lead_agent,
+                            graph_input={"messages": [HumanMessage(content="delegate once")]},
+                            config={
+                                "callbacks": list(tracing_callbacks),
+                                "configurable": {"thread_id": record.thread_id},
+                            },
+                        )
                     )
-                assert caller_span_ids
-                assert set(caller_span_ids) == {caller_span.get_span_context().span_id}
+                else:
+                    caller_span_ids: list[int] = []
+                    with provider.get_tracer("deerflow.tests.task4.embedded").start_as_current_span("embedded-caller") as caller_span:
+                        _invoke_embedded_client(
+                            monkeypatch,
+                            lead_agent,
+                            f"task4-{entry_mode}-{langsmith_enabled}",
+                            langsmith_tracer,
+                            caller_span_ids,
+                        )
+                    assert caller_span_ids
+                    assert set(caller_span_ids) == {caller_span.get_span_context().span_id}
             spans = list(exporter.get_finished_spans())
         finally:
             phoenix.shutdown_phoenix_tracing()

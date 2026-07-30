@@ -1,7 +1,8 @@
 """Trusted authorization values for subagent delegation.
 
-The parent policy is captured when an agent's ``task`` tool is built. Runtime
-metadata is deliberately not an input to this module.
+The parent policy and the parent's resolved model name are captured together
+(as :class:`DelegationParentContext`) when an agent's ``task`` tool is built.
+Runtime metadata is deliberately not an input to this module.
 """
 
 from __future__ import annotations
@@ -58,6 +59,21 @@ class DelegationPolicy:
             "available_skills",
             frozenset(normalized_skills) if normalized_skills is not None else None,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationParentContext:
+    """Trusted parent build-time values bound to one agent's ``task`` tool.
+
+    Both fields are captured when the parent agent is built — never recovered
+    from ``RunnableConfig.metadata`` at invocation time. ``model_name`` is the
+    parent's resolved model name; ``None`` means the parent build had no model
+    name (e.g. SDK factories handed a model instance), in which case subagent
+    ``model="inherit"`` falls back to the configured default model.
+    """
+
+    policy: DelegationPolicy
+    model_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

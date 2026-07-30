@@ -73,6 +73,7 @@ def create_deerflow_agent(
     checkpointer: BaseCheckpointSaver | None = None,
     name: str = "default",
     delegation_policy: DelegationPolicy | None = None,
+    parent_model_name: str | None = None,
 ) -> CompiledStateGraph:
     """Create a DeerFlow agent from plain Python arguments.
 
@@ -104,6 +105,14 @@ def create_deerflow_agent(
         Optional persistence backend.
     name:
         Agent name (passed to middleware that cares, e.g. ``MemoryMiddleware``).
+    delegation_policy:
+        Trusted parent policy required when the subagent feature is enabled.
+    parent_model_name:
+        Resolved parent model name bound into the task tool alongside
+        *delegation_policy*.  Used when a subagent declares
+        ``model="inherit"``.  ``None`` (the default for SDK callers that pass
+        a model *instance*) lets inherited subagents fall back to the
+        configured default model.
 
     Raises
     ------
@@ -132,6 +141,7 @@ def create_deerflow_agent(
             plan_mode=plan_mode,
             extra_middleware=extra_middleware or [],
             delegation_policy=delegation_policy,
+            parent_model_name=parent_model_name,
         )
         # Deduplicate by tool name — user-provided tools take priority.
         existing_names = {t.name for t in effective_tools}
@@ -163,6 +173,7 @@ def _assemble_from_features(
     plan_mode: bool = False,
     extra_middleware: list[AgentMiddleware] | None = None,
     delegation_policy: DelegationPolicy | None = None,
+    parent_model_name: str | None = None,
 ) -> tuple[list[AgentMiddleware], list[BaseTool]]:
     """Build an ordered middleware chain + extra tools from *feat*.
 
@@ -277,9 +288,10 @@ def _assemble_from_features(
             from deerflow.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
 
             chain.append(SubagentLimitMiddleware())
+        from deerflow.subagents.delegation import DelegationParentContext
         from deerflow.tools.builtins.task_tool import build_task_tool
 
-        extra_tools.append(build_task_tool(delegation_policy))
+        extra_tools.append(build_task_tool(DelegationParentContext(policy=delegation_policy, model_name=parent_model_name)))
 
     # --- [12] LoopDetection ---
     if feat.loop_detection is not False:

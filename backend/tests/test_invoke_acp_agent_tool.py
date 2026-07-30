@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from deerflow.config.acp_config import ACPAgentConfig
+from deerflow.config.app_config import AppConfig
 from deerflow.config.extensions_config import ExtensionsConfig, McpServerConfig, set_extensions_config
+from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.tools.builtins.invoke_acp_agent_tool import (
     _build_acp_mcp_servers,
     _build_mcp_servers,
@@ -15,6 +17,11 @@ from deerflow.tools.builtins.invoke_acp_agent_tool import (
     build_invoke_acp_agent_tool,
 )
 from deerflow.tools.tools import get_available_tools
+
+
+def _minimal_app_config(**overrides) -> AppConfig:
+    """Minimal typed AppConfig covering exactly what the catalog loader reads."""
+    return AppConfig(sandbox=SandboxConfig(use="test"), **overrides)
 
 
 def test_build_mcp_servers_filters_disabled_and_maps_transports():
@@ -681,12 +688,7 @@ def test_get_available_tools_includes_invoke_acp_agent_when_agents_configured(mo
         }
     )
 
-    fake_config = SimpleNamespace(
-        tools=[],
-        models=[],
-        tool_search=SimpleNamespace(enabled=False),
-        get_model_config=lambda name: None,
-    )
+    fake_config = _minimal_app_config()
     monkeypatch.setattr("deerflow.tools.tools.get_app_config", lambda: fake_config)
     monkeypatch.setattr(
         "deerflow.config.extensions_config.ExtensionsConfig.from_file",
@@ -764,13 +766,7 @@ def test_get_available_tools_sync_invoke_acp_agent_preserves_thread_workspace(mo
         ),
     )
 
-    explicit_config = SimpleNamespace(
-        tools=[],
-        models=[],
-        tool_search=SimpleNamespace(enabled=False),
-        skill_evolution=SimpleNamespace(enabled=False),
-        sandbox=SimpleNamespace(),
-        get_model_config=lambda name: None,
+    explicit_config = _minimal_app_config(
         acp_agents={"codex": ACPAgentConfig(command="codex-acp", description="Codex CLI")},
     )
     tools = get_available_tools(include_mcp=False, subagent_enabled=False, app_config=explicit_config)
@@ -787,14 +783,7 @@ def test_get_available_tools_sync_invoke_acp_agent_preserves_thread_workspace(mo
 
 def test_get_available_tools_uses_explicit_app_config_for_acp_agents(monkeypatch):
     explicit_agents = {"codex": ACPAgentConfig(command="codex-acp", description="Codex CLI")}
-    explicit_config = SimpleNamespace(
-        tools=[],
-        models=[],
-        tool_search=SimpleNamespace(enabled=False),
-        skill_evolution=SimpleNamespace(enabled=False),
-        get_model_config=lambda name: None,
-        acp_agents=explicit_agents,
-    )
+    explicit_config = _minimal_app_config(acp_agents=explicit_agents)
     sentinel_tool = SimpleNamespace(name="invoke_acp_agent")
     captured: dict[str, object] = {}
 
@@ -811,5 +800,7 @@ def test_get_available_tools_uses_explicit_app_config_for_acp_agents(monkeypatch
 
     tools = get_available_tools(include_mcp=False, subagent_enabled=False, app_config=explicit_config)
 
-    assert captured["agents"] is explicit_agents
+    # AppConfig validates/copies its inputs, so compare by value: the contract
+    # under test is that the explicit config's agents are used, not identity.
+    assert captured["agents"] == explicit_agents
     assert "invoke_acp_agent" in [tool.name for tool in tools]

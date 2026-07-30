@@ -15,7 +15,7 @@ from deerflow.config.tracing_config import get_tracing_config
 from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.sandbox.security import LOCAL_BASH_SUBAGENT_DISABLED_MESSAGE, is_host_bash_allowed
 from deerflow.subagents import SubagentExecutor, get_available_subagent_names, get_subagent_config
-from deerflow.subagents.delegation import DelegationPolicy, DelegationPolicyError, DelegationRequest, resolve_delegation
+from deerflow.subagents.delegation import DelegationParentContext, DelegationPolicyError, DelegationRequest, resolve_delegation
 from deerflow.subagents.executor import (
     SubagentStatus,
     cleanup_background_task,
@@ -178,8 +178,14 @@ def _get_runtime_app_config(runtime: Any) -> "AppConfig | None":
     return None
 
 
-def build_task_tool(delegation_policy: DelegationPolicy) -> BaseTool:
-    """Build one task tool bound to an immutable trusted parent policy."""
+def build_task_tool(parent_context: DelegationParentContext) -> BaseTool:
+    """Build one task tool bound to immutable trusted parent build-time values.
+
+    ``parent_context`` couples the parent's delegation policy with the parent
+    model name resolved when the parent agent was built. Neither value is ever
+    recovered from ``RunnableConfig.metadata``: metadata is caller- and
+    tracing-visible and therefore not an authorization source.
+    """
 
     @tool("task", parse_docstring=True)
     async def task(
@@ -197,7 +203,7 @@ def build_task_tool(delegation_policy: DelegationPolicy) -> BaseTool:
             subagent_type: The configured subagent type to execute.
         """
         return await _run_task(
-            delegation_policy=delegation_policy,
+            parent_context=parent_context,
             runtime=runtime,
             description=description,
             prompt=prompt,
@@ -210,7 +216,7 @@ def build_task_tool(delegation_policy: DelegationPolicy) -> BaseTool:
 
 async def _run_task(
     *,
-    delegation_policy: DelegationPolicy,
+    parent_context: DelegationParentContext,
     runtime: Runtime,
     description: str,
     prompt: str,
@@ -218,6 +224,12 @@ async def _run_task(
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> str:
     """Resolve authorization, start the executor, and stream task progress."""
+    delegation_policy = parent_context.policy
+    # The parent model is a catalog input bound at agent build time. It must
+    # NOT be restored from runtime metadata: a spoofed or stripped
+    # ``metadata.model_name`` would otherwise alter the model-aware tool
+    # catalog (e.g. vision-only tools) and change delegated capabilities.
+    parent_model = parent_context.model_name
     runtime_app_config = _get_runtime_app_config(runtime)
     resolved_app_config = runtime_app_config or get_app_config()
     cache_token_usage = _token_usage_cache_enabled(resolved_app_config)
@@ -237,10 +249,8 @@ async def _run_task(
     sandbox_state = None
     thread_data = None
     thread_id = None
-    parent_model = None
     trace_id = None
     user_id = None
-    metadata: dict = {}
 
     if runtime is not None:
         sandbox_state = runtime.state.get("sandbox")
@@ -249,11 +259,9 @@ async def _run_task(
         if thread_id is None:
             thread_id = runtime.config.get("configurable", {}).get("thread_id")
 
-        # Try to get parent model from configurable
+        # Tracing-only metadata: the trace id correlates logs and spans but
+        # never participates in tool, skill, model, or authorization decisions.
         metadata = runtime.config.get("metadata", {})
-        parent_model = metadata.get("model_name")
-
-        # Get or generate trace_id for distributed tracing
         trace_id = metadata.get("trace_id") or str(uuid.uuid4())[:8]
 
     # Get user_id for tracing (uses standard resolution order)

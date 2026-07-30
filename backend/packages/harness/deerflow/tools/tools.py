@@ -25,6 +25,19 @@ BUILTIN_TOOLS = [
 ToolSource = Literal["configured", "builtin", "mcp", "acp"]
 
 
+def _bound_parent_model_name(model_name: str | None, config: AppConfig) -> str | None:
+    """Resolve the parent model name bound to a build-time task tool.
+
+    Mirrors the catalog's own fallback so the value bound into the task tool
+    matches the model the parent agent was actually built with.
+    """
+    if model_name is not None:
+        return model_name
+    if config.models:
+        return config.models[0].name
+    return None
+
+
 class ToolCatalogLoadError(RuntimeError):
     """Raised when strict tool discovery cannot produce a complete catalog."""
 
@@ -46,11 +59,7 @@ class ToolCatalogSnapshot:
 
     def project(self, groups: tuple[str, ...] | list[str] | None = None) -> list[BaseTool]:
         allowed_groups = set(groups) if groups is not None else None
-        projected = [
-            entry.tool
-            for entry in self.entries
-            if entry.source != "configured" or allowed_groups is None or entry.configured_group in allowed_groups
-        ]
+        projected = [entry.tool for entry in self.entries if entry.source != "configured" or allowed_groups is None or entry.configured_group in allowed_groups]
         return _deduplicate_tools(projected)
 
 
@@ -262,9 +271,11 @@ def get_available_tools(
             from deerflow.subagents.delegation import DelegationPolicyError
 
             raise DelegationPolicyError("delegation_policy is required when subagent_enabled=True")
+        from deerflow.subagents.delegation import DelegationParentContext
         from deerflow.tools.builtins.task_tool import build_task_tool
 
-        tools.append(build_task_tool(delegation_policy))
+        bound_model_name = _bound_parent_model_name(model_name, app_config or get_app_config())
+        tools.append(build_task_tool(DelegationParentContext(policy=delegation_policy, model_name=bound_model_name)))
         logger.info("Including subagent tools (task)")
     return _deduplicate_tools(tools)
 
@@ -293,9 +304,11 @@ def load_parent_tool_set(
     )
     tools = catalog.project(delegation_policy.tool_groups)
     if subagent_enabled:
+        from deerflow.subagents.delegation import DelegationParentContext
         from deerflow.tools.builtins.task_tool import build_task_tool
 
-        tools.append(build_task_tool(delegation_policy))
+        bound_model_name = _bound_parent_model_name(model_name, app_config)
+        tools.append(build_task_tool(DelegationParentContext(policy=delegation_policy, model_name=bound_model_name)))
     tools = _deduplicate_tools(tools)
     skills = tuple(get_enabled_skills_for_config(app_config))
     return ParentToolSet(

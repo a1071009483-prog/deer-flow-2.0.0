@@ -360,19 +360,40 @@ def _invoke_embedded_client(
     between_yield_span_ids: list[int] | None = None,
 ) -> None:
     from opentelemetry import trace
+    from support.client_factory import make_client_stub
 
     from deerflow import client as client_module
+    from deerflow.tools.tools import ParentToolSet
 
-    client = object.__new__(client_module.DeerFlowClient)
-    client._agent = agent
-    client._model_name = "parent-compat-local"
-    client._thinking_enabled = False
-    client._subagent_enabled = False
-    client._plan_mode = False
-    client._agent_name = entry_name
-    client._available_skills = None
-    client._environment = "test"
-    client._agent_config_key = ("parent-compat-local", False, False, False, entry_name, None)
+    # ``_ensure_agent`` keys its cache on the fingerprinted ParentToolSet, so
+    # the stub must return a fixed tool set whose fingerprints match the
+    # preset ``_agent_config_key`` — otherwise the preset agent would be
+    # rebuilt and the test would need a real config.yaml.
+    tool_set = ParentToolSet(
+        tools=(),
+        parent_policy_fingerprint="sha256:parent-compat-policy",
+        tool_catalog_fingerprint="sha256:parent-compat-catalog",
+    )
+    client = make_client_stub(
+        agent=agent,
+        model_name="parent-compat-local",
+        thinking_enabled=False,
+        subagent_enabled=False,
+        plan_mode=False,
+        agent_name=entry_name,
+        available_skills=None,
+        environment="test",
+        agent_config_key=(
+            "parent-compat-local",
+            False,
+            False,
+            False,
+            entry_name,
+            tool_set.parent_policy_fingerprint,
+            tool_set.tool_catalog_fingerprint,
+        ),
+    )
+    monkeypatch.setattr(client, "_get_tools", lambda **_kwargs: tool_set)
     monkeypatch.setattr(
         client_module,
         "build_tracing_callbacks",
