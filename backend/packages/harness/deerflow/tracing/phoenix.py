@@ -26,14 +26,26 @@ from deerflow.tracing.otel_context import (
 
 type _PhoenixConfigKey = tuple[str, str, bool, bool, bool, str | None]
 
+_SAFE_MODE_DROP_KEY_MARKERS = (
+    "retrieval.documents",
+    "llm.prompt_template",
+    "llm.function_call",
+)
+
 
 class DeerFlowTraceConfig(oi_config.TraceConfig):
     """Instance-local safe-capture policy for DeerFlow's Phoenix export.
 
-    Delegates content hiding to the upstream ``TraceConfig`` and applies an
-    exact allowlist to ``SpanAttributes.METADATA`` only when safe capture is
-    active.  No process-level ``OPENINFERENCE_*`` environment variables are
-    read or written.
+    Delegates content hiding to the upstream ``TraceConfig`` and extends it
+    where the locked LangChain tracer has no hide flag: safe mode also drops
+    retriever documents, prompt templates, and top-level function-call
+    arguments, and applies an exact allowlist to ``SpanAttributes.METADATA``.
+    Every upstream field is initialized explicitly, so no process-level
+    ``OPENINFERENCE_*`` environment variable is read or written.
+
+    While a DeerFlow ``deerflow.run`` boundary is active (``using_attributes``
+    context), its session id and correlation metadata win over caller-supplied
+    values, so caller metadata cannot forge DeerFlow's trusted correlation.
     """
 
     def __init__(
@@ -48,28 +60,71 @@ class DeerFlowTraceConfig(oi_config.TraceConfig):
             hide_outputs=hidden,
             hide_input_messages=hidden,
             hide_output_messages=hidden,
+            hide_input_images=hidden,
+            hide_input_text=hidden,
+            hide_output_text=hidden,
             hide_prompts=hidden,
             hide_choices=hidden,
             hide_llm_invocation_parameters=hidden,
             hide_llm_tools=hidden,
+            hide_embedding_vectors=hidden,
+            hide_embeddings_vectors=hidden,
+            hide_embeddings_text=hidden,
+            enable_genai_semconv=False,
+            base64_image_max_length=32_000,
         )
         object.__setattr__(self, "_deerflow_capture_content", capture_content)
         object.__setattr__(self, "_deerflow_metadata_allowlist", frozenset(metadata_allowlist))
 
     def mask(self, key: str, value: Any) -> Any:
         masked = super().mask(key, value)
-        if masked is None or self._deerflow_capture_content:
+        if masked is None:
+            return None
+        if key == SpanAttributes.SESSION_ID:
+            context_session_id = self._context_value(SpanAttributes.SESSION_ID)
+            if context_session_id is not None:
+                return context_session_id
             return masked
-        if key != SpanAttributes.METADATA:
+        if key == SpanAttributes.METADATA:
+            return self._mask_metadata(masked)
+        if self._deerflow_capture_content:
             return masked
+        if any(marker in key for marker in _SAFE_MODE_DROP_KEY_MARKERS):
+            return None
+        return masked
+
+    def _mask_metadata(self, masked: Any) -> Any:
+        trusted = self._context_metadata()
         try:
             decoded = json.loads(masked)
         except (TypeError, ValueError):
-            return None
+            decoded = None
         if not isinstance(decoded, dict):
-            return None
+            return masked if self._deerflow_capture_content else None
+        if trusted:
+            decoded = {**decoded, **trusted}
+        if self._deerflow_capture_content:
+            if trusted:
+                return json.dumps(decoded, sort_keys=True, separators=(",", ":"))
+            return masked
         filtered = {name: item for name, item in decoded.items() if name in self._deerflow_metadata_allowlist and not name.startswith("langfuse_")}
         return json.dumps(filtered, sort_keys=True, separators=(",", ":")) if filtered else None
+
+    def _context_metadata(self) -> dict[str, Any] | None:
+        raw = self._context_value(SpanAttributes.METADATA)
+        if not isinstance(raw, str):
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    @staticmethod
+    def _context_value(key: str) -> Any:
+        from opentelemetry import context as context_api
+
+        return context_api.get_value(key)
 
 
 _PARENT_COMPAT_DEPENDENCY_VERSIONS = {
