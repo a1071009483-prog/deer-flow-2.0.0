@@ -26,6 +26,7 @@ from deerflow.tracing.otel_context import (
 
 type _PhoenixConfigKey = tuple[str, str, bool, bool, bool, str | None]
 
+
 class DeerFlowTraceConfig(oi_config.TraceConfig):
     """Instance-local safe-capture policy for DeerFlow's Phoenix export.
 
@@ -67,12 +68,7 @@ class DeerFlowTraceConfig(oi_config.TraceConfig):
             return None
         if not isinstance(decoded, dict):
             return None
-        filtered = {
-            name: item
-            for name, item in decoded.items()
-            if name in self._deerflow_metadata_allowlist
-            and not name.startswith("langfuse_")
-        }
+        filtered = {name: item for name, item in decoded.items() if name in self._deerflow_metadata_allowlist and not name.startswith("langfuse_")}
         return json.dumps(filtered, sort_keys=True, separators=(",", ":")) if filtered else None
 
 
@@ -204,10 +200,7 @@ def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = Non
                     owned_instrumentor = instrumentor
                     _install_openinference_langchain_parent_compat(tracer_provider)
                 else:
-                    logger.warning(
-                        "Phoenix tracing left an existing host-owned LangChain instrumentor unchanged; "
-                        "only DeerFlow manual run spans are guaranteed on the Phoenix provider."
-                    )
+                    logger.warning("Phoenix tracing left an existing host-owned LangChain instrumentor unchanged; only DeerFlow manual run spans are guaranteed on the Phoenix provider.")
         except Exception as exc:
             if owned_instrumentor is not None:
                 try:
@@ -683,5 +676,3 @@ def _install_openinference_langchain_parent_compat(tracer_provider: Any) -> None
     _parent_compat_base_class = OpenInferenceTracer
     _parent_compat_class = PhoenixParentCompatOpenInferenceTracer
     tracer.__class__ = PhoenixParentCompatOpenInferenceTracer
-
-

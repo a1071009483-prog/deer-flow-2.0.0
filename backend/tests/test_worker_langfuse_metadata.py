@@ -212,10 +212,25 @@ def _install_fake_openinference_runtime(
     monkeypatch.setitem(sys.modules, "openinference.instrumentation.config", config_module)
     monkeypatch.setitem(sys.modules, "openinference.semconv", semconv_module)
     monkeypatch.setitem(sys.modules, "openinference.semconv.trace", trace_module)
+
+    class _FakeInstrumentor:
+        def __init__(self) -> None:
+            self._is_instrumented_by_opentelemetry = False
+
+        @property
+        def is_instrumented_by_opentelemetry(self) -> bool:
+            return self._is_instrumented_by_opentelemetry
+
+        def instrument(self, *, tracer_provider: Any, config: Any) -> None:
+            self._is_instrumented_by_opentelemetry = True
+
+        def uninstrument(self) -> None:
+            self._is_instrumented_by_opentelemetry = False
+
+    monkeypatch.setattr(phoenix, "_get_langchain_instrumentor", lambda: _FakeInstrumentor)
     monkeypatch.setattr(trace, "get_tracer", lambda *_args, **_kwargs: _FakeTracer(spans))
     monkeypatch.setattr(phoenix, "_validate_openinference_langchain_parent_contract", lambda: None)
     monkeypatch.setattr(phoenix, "_install_openinference_langchain_parent_compat", lambda *_args: None)
-    monkeypatch.setattr(phoenix, "_snapshot_openinference_instrumentors", lambda: [])
     monkeypatch.setattr(phoenix, "_get_phoenix_tracer", lambda *_args, **_kwargs: _FakeTracer(spans))
 
 
