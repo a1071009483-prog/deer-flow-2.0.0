@@ -210,18 +210,18 @@ TBD - Define Phoenix as an opt-in external tracing provider while preserving Dee
 
 #### Scenario: Content capture disabled
 - **WHEN** Phoenix tracing 启用且 content capture 关闭
-- **THEN** 导出的 Phoenix spans SHALL 按配置的 instrumentation 行为省略 prompt、completion 和 tool payload content
+- **THEN** 导出的 Phoenix spans SHALL 按实例级 `DeerFlowTraceConfig` 的隐藏配置省略 prompt、completion 和 tool payload content
 - **AND** 支持的非内容类 correlation metadata SHALL 仍然可用
 - **AND** `PHOENIX_METADATA_ALLOWLIST` SHALL 默认为空，并将配置值解析为逗号分隔、去空白、按首次出现顺序去重的精确 caller metadata 顶层 key
-- **AND** Phoenix root context SHALL 只接收 allowlist 命中的 caller metadata 和服务端权威 correlation metadata，且 SHALL NOT 接收其他 caller metadata、caller tags 或其他 provider 的 reserved metadata；allowlist 中的其他 provider reserved key（至少 `langfuse_*`）SHALL 被忽略
-- **AND** 传给 OpenInference LangChain auto-instrumentation 的 root `RunnableConfig.metadata` SHALL 包含与 Phoenix root context 相同的 Phoenix-safe allowlist caller metadata 和服务端权威 correlation metadata，并且 MAY 额外包含其他已启用 provider 所需且由 DeerFlow 构造的受信 reserved metadata
+- **AND** Phoenix root context 与 OpenInference LangChain auto-instrumentor 的导出 metadata SHALL 只包含 allowlist 命中的 caller metadata 和服务端权威 correlation metadata，且 SHALL NOT 包含其他 caller metadata、caller tags 或其他 provider 的 reserved metadata；allowlist 中的其他 provider reserved key（至少 `langfuse_*`）SHALL 被忽略
 - **AND** caller SHALL NOT 能通过伪造同名 metadata 覆盖 effective session/thread、user、assistant/subagent、model、environment、root run name 或 run id
-- **AND** worker SHALL 在 agent factory 解析 effective model 后，从 factory 前 caller metadata 快照重建实际传给 `agent.astream()` 的 root `RunnableConfig.metadata`，使其与 Phoenix root 的 authoritative `model_name` 一致且不导出 factory 追加的非 allowlist metadata
+- **AND** 实现 SHALL NOT 修改、替换或重建传给 LangGraph、tools、skills、LangSmith、Langfuse 或 custom callbacks 的 canonical `RunnableConfig.metadata`
 
 #### Scenario: Content capture disabled allowlist example
 - **WHEN** `PHOENIX_CAPTURE_CONTENT=false` 且 `PHOENIX_METADATA_ALLOWLIST=request_id,tenant_id`
-- **THEN** caller 的 `request_id` 和 `tenant_id` SHALL 同时进入 Phoenix root metadata 与 OpenInference root `RunnableConfig.metadata`
-- **AND** 未列入字段 SHALL 被删除
+- **THEN** caller 的 `request_id` 和 `tenant_id` SHALL 进入 Phoenix root metadata 与 OpenInference 导出 metadata
+- **AND** 未列入字段 SHALL 被排除在 Phoenix 导出之外
+- **AND** canonical `RunnableConfig.metadata` SHALL 保留原始 caller 字段
 - **AND** allowlist SHALL NOT 允许 caller tags 导出
 
 #### Scenario: Content capture enabled
@@ -255,27 +255,31 @@ TBD - Define Phoenix as an opt-in external tracing provider while preserving Dee
 
 #### Scenario: Phoenix 初始化使用独立 provider
 - **WHEN** Phoenix tracing 被启用且尚未初始化
-- **THEN** 系统 SHALL 调用 `phoenix.otel.register(..., set_global_tracer_provider=False)`
-- **AND** 该调用 SHALL 使用 `batch=True` 与 `auto_instrument=False`，使 DeerFlow 在任何 OpenInference instrumentor mutation 前先获得 provider
+- **THEN** 系统 SHALL 调用 `phoenix.otel.register(..., set_global_tracer_provider=False, batch=True, auto_instrument=False, shutdown_on_exit=False)`
 - **AND** 系统 SHALL 保存返回的 Phoenix `TracerProvider`
-- **AND** 系统 SHALL 枚举 `openinference_instrumentor` entry points，并将 `deerflow.run` 与全部启用的 OpenInference instrumentors 显式绑定到同一保存的 provider
+- **AND** 系统 SHALL 显式初始化单个 `LangChainInstrumentor` 并将其与保存的 provider 绑定
+- **AND** 系统 SHALL NOT 枚举 `openinference_instrumentor` entry points 或加载无关 instrumentor
 - **AND** 宿主 global tracer provider SHALL 保持不变
 
 #### Scenario: Foreign instrumentor 或失败初始化
-- **WHEN** 已有 LangChain/OpenInference instrumentor 由非 Phoenix provider 拥有，或 Phoenix 初始化在 provider 创建后失败
-- **THEN** 系统 SHALL 在激活 tracing 前 fail fast
-- **AND** 系统 SHALL shutdown 新建但未激活的 Phoenix provider
-- **AND** 系统 SHALL 逆序恢复所有 attempted instrumentors、content-capture 环境、active provider state 与兼容层
+- **WHEN** `LangChainInstrumentor` 已由非 DeerFlow provider 拥有
+- **THEN** 系统 SHALL 不调用 `instrument()` 或 `uninstrument()` 修改该 instrumentor
+- **AND** 系统 SHALL 创建 DeerFlow 的 Phoenix provider，并保证仅 manual `deerflow.run` spans 落在该 provider 上
+- **AND** 系统 SHALL 记录 warning 说明 host-owned instrumentor 未改变
+- **AND WHEN** Phoenix 初始化在 provider 创建后失败
+- **THEN** 系统 SHALL shutdown 新建但未激活的 Phoenix provider
+- **AND** 系统 SHALL 逆序清理已拥有的 `LangChainInstrumentor`、active provider state 与兼容层
 - **AND** 系统 SHALL NOT 修改 foreign instrumentor state 或留下 partial instrumentation
+- **AND** 系统 SHALL NOT 读取或写入 `OPENINFERENCE_*` 环境变量
 
 #### Scenario: Batch exporter 与受控关闭
 - **WHEN** Phoenix tracing 在生产运行路径初始化和服务受控关闭
 - **THEN** 系统 SHALL 默认使用 `batch=True` 和 `BatchSpanProcessor`
 - **AND** 系统 SHALL 使用 `OTEL_BSP_MAX_QUEUE_SIZE`、`OTEL_BSP_SCHEDULE_DELAY`、`OTEL_BSP_EXPORT_TIMEOUT`、`OTEL_BSP_MAX_EXPORT_BATCH_SIZE` 配置批处理
 - **AND** 受控关闭 SHALL 在 `shutdown` 前调用 `force_flush`
-- **AND** 受控关闭 SHALL 在潜在阻塞清理前解除 Phoenix provider 的 OTel SDK `atexit` handler
+- **AND** 受控关闭 SHALL NOT 读取或赋值 provider 的私有 `_atexit_handler`
 - **AND** gateway SHALL 在 in-flight run drain 后从 daemon cleanup thread 执行 SDK 清理，并只在 gateway shutdown deadline 内等待
-- **AND** 成功关闭 SHALL 逆序卸载 DeerFlow 拥有的全部 OpenInference instrumentors，并以 compare-and-restore 语义恢复 DeerFlow 设置的 content-capture 环境
+- **AND** 成功关闭 SHALL 仅卸载 DeerFlow 拥有的 `LangChainInstrumentor`
 - **AND** 任意单次 graph run SHALL NOT 调用 provider `shutdown`
 
 ### Requirement: Parent 与 baggage 独立隔离

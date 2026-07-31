@@ -528,6 +528,8 @@ LangSmith and Langfuse are both supported. The wiring lives in two layers:
 - Phoenix is not a callback provider.
 - Do not attach Phoenix at model creation inside graph runs.
 - Gateway, embedded client, and subagent graph invocation roots own the active Phoenix context.
+- Phoenix safe capture is implemented by an instance-local `DeerFlowTraceConfig` passed to the owned `LangChainInstrumentor`; it does not mutate `OPENINFERENCE_*` environment variables or canonical `RunnableConfig.metadata`.
+- DeerFlow initializes only `LangChainInstrumentor`; a host-owned LangChain instrumentor is left unchanged and only manual `deerflow.run` spans are guaranteed on the DeerFlow provider.
 - A successful subagent trace must be `tools -> task -> deerflow.run -> subagent graph -> graph descendants`; a same-trace sibling boundary or a graph that bypasses its boundary is a tracing defect, not a supported linked-root shape.
 - Before subagent isolated-loop submission, `task_tool` uses the current runnable callback manager's `parent_run_id` to capture the registered Phoenix callback span as the logical handoff parent. If Phoenix is disabled or the Phoenix-owned registry cannot resolve that span, it falls back to ambient OTel carrier capture without failing the task. Both paths preserve `PHOENIX_PROPAGATE_BAGGAGE`.
 - Each `SubagentExecutor` invocation assigns a fresh UUID to the automatic graph root and binds that exact run ID, once, to the active `deerflow.run` boundary `SpanContext`. The lock-protected binding is atomically consumed on graph start or cleaned on scope exit; UUID-keyed registrations isolate parallel tasks, while ordinary model/tool/chain/retriever/LLM descendant parent resolution remains unchanged.
