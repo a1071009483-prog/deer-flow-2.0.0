@@ -818,6 +818,22 @@ async def test_capture_content_disabled_filters_caller_metadata_from_phoenix(mon
         "caller_tags": None,
         "run_id": "run-private-metadata",
     }
+    expected_canonical_metadata = {
+        "prompt": "TOP SECRET",
+        "payload": {"token": "abc"},
+        "request_id": "request-123",
+        "tenant_id": "tenant-456",
+        "unlisted": "must-not-export",
+        "session_id": "caller-session",
+        "thread_id": "caller-thread",
+        "user_id": "caller-user",
+        "assistant_id": "caller-agent",
+        "model_name": "caller-model",
+        "environment": "caller-environment",
+        "root_run_name": "caller-root",
+        "caller_tags": ["secret:metadata"],
+        "run_id": "caller-run",
+    }
     assert using_attributes_calls == [
         {
             "session_id": "thread-authoritative",
@@ -830,7 +846,8 @@ async def test_capture_content_disabled_filters_caller_metadata_from_phoenix(mon
     assert "metadata" not in spans[0].attributes
     assert spans[0].attributes["tag.tags"] == []
     assert fake_agent.captured_config is not None
-    assert fake_agent.captured_config.get("metadata") == expected_metadata
+    # Canonical metadata is unchanged by Phoenix safe-mode filtering.
+    assert fake_agent.captured_config.get("metadata") == expected_canonical_metadata
 
 
 @pytest.mark.asyncio
@@ -952,7 +969,11 @@ async def test_safe_mode_captures_default_model_from_factory_metadata(monkeypatc
         },
     )
 
-    expected_metadata = {
+    expected_canonical_metadata = {
+        "request_id": "request-default-model",
+        "model_name": "resolved-default-model",
+    }
+    expected_export_metadata = {
         "request_id": "request-default-model",
         "session_id": "thread-default-model",
         "thread_id": "thread-default-model",
@@ -965,8 +986,10 @@ async def test_safe_mode_captures_default_model_from_factory_metadata(monkeypatc
         "run_id": "run-default-model",
     }
     assert fake_agent.captured_config is not None
-    assert fake_agent.captured_config.get("metadata") == expected_metadata
-    assert using_attributes_calls[0]["metadata"] == expected_metadata
+    # Canonical metadata preserves the factory-resolved model but not Phoenix export fields.
+    assert fake_agent.captured_config.get("metadata") == expected_canonical_metadata
+    assert using_attributes_calls[0]["metadata"] == expected_export_metadata
+    assert "metadata" not in spans[0].attributes
     assert "metadata" not in spans[0].attributes
 
 

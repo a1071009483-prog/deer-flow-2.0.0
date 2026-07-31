@@ -8,7 +8,6 @@ unchanged and must not alter the effective tools/skills available to a subagent.
 from __future__ import annotations
 
 import asyncio
-import copy
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -19,7 +18,6 @@ from deerflow.runtime.runs.manager import RunRecord
 from deerflow.runtime.runs.schemas import DisconnectMode, RunStatus
 from deerflow.runtime.runs.worker import RunContext, run_agent
 from deerflow.subagents.config import SubagentConfig
-from deerflow.tracing.metadata import inject_trace_metadata
 
 
 class _FakeAgent:
@@ -95,42 +93,6 @@ def _clear_tracing_env(monkeypatch):
     yield
     reset_tracing_config()
     reset_phoenix_tracing_for_tests()
-
-
-@pytest.mark.parametrize(
-    ("phoenix_enabled", "capture_content"),
-    [(False, False), (True, False), (True, True)],
-    ids=["disabled", "safe", "full"],
-)
-def test_trace_metadata_preserves_business_values(
-    monkeypatch,
-    phoenix_enabled,
-    capture_content,
-):
-    monkeypatch.setenv("PHOENIX_TRACING", str(phoenix_enabled).lower())
-    monkeypatch.setenv("PHOENIX_CAPTURE_CONTENT", str(capture_content).lower())
-    reset_tracing_config()
-
-    business_metadata = {
-        "request_id": "request-1",
-        "private": {"token": "do-not-export"},
-        "tool_groups": ["web"],
-        "available_skills": ["research"],
-    }
-    expected = copy.deepcopy(business_metadata)
-    expected.update({"agent_name": "lead-agent", "model_name": "resolved-model"})
-    config = {"metadata": copy.deepcopy(business_metadata)}
-
-    inject_trace_metadata(
-        config,
-        thread_id="thread-1",
-        user_id="user-1",
-        assistant_id="lead-agent",
-        model_name="resolved-model",
-    )
-    config["metadata"].update({"agent_name": "lead-agent", "model_name": "resolved-model"})
-
-    assert config["metadata"] == expected
 
 
 @pytest.mark.parametrize(

@@ -49,7 +49,7 @@ from deerflow.tracing import (
     build_phoenix_correlation_metadata,
     build_tracing_callbacks,
     deserialize_trace_context,
-    inject_trace_metadata,
+    inject_langfuse_metadata,
     open_phoenix_root_scope,
 )
 from deerflow.uploads.manager import (
@@ -625,15 +625,13 @@ class DeerFlowClient:
         environment = self._environment or os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT")
         assistant_id = self._agent_name or "lead-agent"
         model_name = configurable.get("model_name") or self._model_name
-        inject_trace_metadata(
+        inject_langfuse_metadata(
             config,
             thread_id=thread_id,
             user_id=effective_user_id,
             assistant_id=assistant_id,
             model_name=model_name,
             environment=environment,
-            caller_tags=config.get("tags"),
-            root_run_name=config.get("run_name"),
         )
 
         self._ensure_agent(config)

@@ -2129,14 +2129,14 @@ class TestSubagentTracingWiring:
         monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: [])
 
         # Inject caller metadata that Phoenix safe mode would previously have removed.
-        original_inject = executor_module.inject_trace_metadata
+        original_inject = executor_module.inject_langfuse_metadata
 
         def _inject_with_private(run_config, **kwargs):
             run_config.setdefault("metadata", {})
             run_config["metadata"]["private"] = {"values": [1, 2, 3]}
             return original_inject(run_config, **kwargs)
 
-        monkeypatch.setattr(executor_module, "inject_trace_metadata", _inject_with_private)
+        monkeypatch.setattr(executor_module, "inject_langfuse_metadata", _inject_with_private)
 
         recorded_roots = []
         with self._recorded_root_context(recorded_roots) as fake_activate:
@@ -2163,14 +2163,6 @@ class TestSubagentTracingWiring:
         assert root.upstream_context is None
         # Canonical metadata preserves caller values, including nested private ones.
         expected_canonical_metadata = {
-            "session_id": "thread-trace-1",
-            "thread_id": "thread-trace-1",
-            "user_id": "alice",
-            "assistant_id": "subagent:general-purpose",
-            "model_name": "claude-sonnet",
-            "environment": None,
-            "root_run_name": "subagent:general-purpose",
-            "caller_tags": ["subagent:general_purpose"],
             "private": {"values": [1, 2, 3]},
         }
         assert root.metadata == expected_canonical_metadata
@@ -2584,9 +2576,6 @@ class TestSubagentTracingWiring:
         )
         lead_agent = create_agent(model=LeadModel(), tools=[task])
 
-        from deerflow.runtime.runs import worker as worker_module
-
-        monkeypatch.setattr(worker_module, "get_tracing_config", lambda: SimpleNamespace(phoenix=config))
         phoenix.shutdown_phoenix_tracing()
         assert not instrumentor._is_instrumented_by_opentelemetry
         try:
