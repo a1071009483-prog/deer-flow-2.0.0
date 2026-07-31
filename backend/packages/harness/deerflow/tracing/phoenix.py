@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import atexit
-import importlib.metadata
 import json
 import logging
 import threading
@@ -93,7 +91,8 @@ _phoenix_trace_config: DeerFlowTraceConfig | None = None
 _parent_compat_tracer: Any | None = None
 _parent_compat_base_class: type[Any] | None = None
 _parent_compat_class: type[Any] | None = None
-_phoenix_owned_instrumentors: list[_InstrumentorSnapshot] = []
+_phoenix_owned_langchain_instrumentor: Any | None = None
+_langchain_instrumentor: Any | None = None
 _RUN_BOUNDARY_SPAN_NAME = "deerflow.run"
 _DEFAULT_SHUTDOWN_TIMEOUT_MILLIS = 30_000
 
@@ -134,11 +133,14 @@ def capture_current_phoenix_trace_context(
     return capture_current_trace_context(include_baggage=include_baggage)
 
 
-@dataclass(frozen=True)
-class _InstrumentorSnapshot:
-    instrumentor: Any
-    instance_state: dict[str, Any]
-    was_instrumented: bool
+def _get_langchain_instrumentor() -> Any:
+    """Lazy import of ``LangChainInstrumentor`` to avoid loading on disabled paths."""
+    global _langchain_instrumentor
+    if _langchain_instrumentor is None:
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+
+        _langchain_instrumentor = LangChainInstrumentor
+    return _langchain_instrumentor
 
 
 @dataclass(frozen=True)
@@ -156,7 +158,7 @@ class PhoenixRootContext:
 
 def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = None) -> None:
     """Lazy, process-wide, idempotent Phoenix/OpenInference setup."""
-    global _active_config_key, _phoenix_owned_instrumentors
+    global _active_config_key, _phoenix_owned_langchain_instrumentor
     global _phoenix_trace_config, _phoenix_tracer_provider
 
     phoenix_config = config or get_tracing_config().phoenix
@@ -175,13 +177,8 @@ def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = Non
             metadata_allowlist=tuple(phoenix_config.metadata_allowlist),
         )
         tracer_provider: Any | None = None
-        instrumentor_snapshots: list[_InstrumentorSnapshot] = []
-        attempted_instrumentors: list[_InstrumentorSnapshot] = []
-        owned_instrumentors: list[_InstrumentorSnapshot] = []
+        owned_instrumentor: Any | None = None
         try:
-            if phoenix_config.auto_instrument:
-                instrumentor_snapshots = _snapshot_openinference_instrumentors()
-
             from phoenix.otel import register
 
             register_kwargs = {
@@ -190,25 +187,33 @@ def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = Non
                 "auto_instrument": False,
                 "set_global_tracer_provider": False,
                 "batch": True,
+                "shutdown_on_exit": False,
             }
             if phoenix_config.api_key:
                 register_kwargs["api_key"] = phoenix_config.api_key
             tracer_provider = register(**register_kwargs)
             if phoenix_config.auto_instrument:
-                _reject_foreign_instrumentors(instrumentor_snapshots)
-                _validate_openinference_langchain_parent_contract()
-                for snapshot in instrumentor_snapshots:
-                    attempted_instrumentors.append(snapshot)
-                    snapshot.instrumentor.instrument(
+                instrumentor = _get_langchain_instrumentor()()
+                if not instrumentor.is_instrumented_by_opentelemetry:
+                    instrumentor.instrument(
                         tracer_provider=tracer_provider,
                         config=trace_config,
                     )
-                    if not getattr(snapshot.instrumentor, "_is_instrumented_by_opentelemetry", False):
-                        raise PhoenixTracingError("Phoenix tracing could not instrument an OpenInference entry point.")
-                    owned_instrumentors.append(snapshot)
-                _install_openinference_langchain_parent_compat(tracer_provider)
+                    if not instrumentor.is_instrumented_by_opentelemetry:
+                        raise PhoenixTracingError("Phoenix tracing could not instrument LangChain.")
+                    owned_instrumentor = instrumentor
+                    _install_openinference_langchain_parent_compat(tracer_provider)
+                else:
+                    logger.warning(
+                        "Phoenix tracing left an existing host-owned LangChain instrumentor unchanged; "
+                        "only DeerFlow manual run spans are guaranteed on the Phoenix provider."
+                    )
         except Exception as exc:
-            _rollback_instrumentors(attempted_instrumentors)
+            if owned_instrumentor is not None:
+                try:
+                    owned_instrumentor.uninstrument()
+                except Exception:
+                    logger.exception("Phoenix tracing could not uninstrument the owned LangChain instrumentor during failure cleanup.")
             _clear_phoenix_state()
             if tracer_provider is not None:
                 _shutdown_provider(tracer_provider, force_flush=False)
@@ -217,7 +222,7 @@ def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = Non
         _phoenix_tracer_provider = tracer_provider
         _phoenix_trace_config = trace_config
         _active_config_key = config_key
-        _phoenix_owned_instrumentors = owned_instrumentors
+        _phoenix_owned_langchain_instrumentor = owned_instrumentor
 
 
 def shutdown_phoenix_tracing(*, timeout_millis: int = _DEFAULT_SHUTDOWN_TIMEOUT_MILLIS) -> None:
@@ -226,7 +231,13 @@ def shutdown_phoenix_tracing(*, timeout_millis: int = _DEFAULT_SHUTDOWN_TIMEOUT_
 
     with _init_lock:
         tracer_provider = _phoenix_tracer_provider
+        owned_instrumentor = _phoenix_owned_langchain_instrumentor
         _clear_phoenix_state()
+        if owned_instrumentor is not None:
+            try:
+                owned_instrumentor.uninstrument()
+            except Exception:
+                logger.exception("Phoenix tracing could not uninstrument the owned LangChain instrumentor during shutdown.")
         if tracer_provider is not None:
             _shutdown_provider(tracer_provider, timeout_millis=timeout_millis)
 
@@ -446,18 +457,22 @@ def open_phoenix_root_scope(root: PhoenixRootContext) -> PhoenixRootScope:
 
 
 def _clear_phoenix_state() -> None:
-    global _active_config_key, _parent_compat_base_class, _parent_compat_class, _parent_compat_tracer
-    global _phoenix_owned_instrumentors, _phoenix_trace_config, _phoenix_tracer_provider
+    global _active_config_key
+    global _parent_compat_base_class
+    global _parent_compat_class
+    global _parent_compat_tracer
+    global _phoenix_owned_langchain_instrumentor
+    global _phoenix_trace_config
+    global _phoenix_tracer_provider
 
     with _graph_root_parent_override_lock:
         _graph_root_parent_overrides.clear()
     if _parent_compat_tracer is not None and _parent_compat_base_class is not None and _parent_compat_tracer.__class__ is _parent_compat_class:
         _parent_compat_tracer.__class__ = _parent_compat_base_class
-    _uninstrument_owned_instrumentors(_phoenix_owned_instrumentors)
     _parent_compat_tracer = None
     _parent_compat_base_class = None
     _parent_compat_class = None
-    _phoenix_owned_instrumentors = []
+    _phoenix_owned_langchain_instrumentor = None
     _phoenix_trace_config = None
     _phoenix_tracer_provider = None
     _active_config_key = None
@@ -469,7 +484,6 @@ def _shutdown_provider(
     timeout_millis: int = _DEFAULT_SHUTDOWN_TIMEOUT_MILLIS,
     force_flush: bool = True,
 ) -> None:
-    _relinquish_provider_atexit_hook(tracer_provider)
     if force_flush:
         try:
             flushed = tracer_provider.force_flush(timeout_millis=timeout_millis)
@@ -481,68 +495,6 @@ def _shutdown_provider(
         tracer_provider.shutdown()
     except Exception:
         logger.exception("Phoenix tracing provider shutdown failed.")
-
-
-def _relinquish_provider_atexit_hook(tracer_provider: Any) -> None:
-    """Detach the SDK's private exit hook before a blocking exporter operation.
-
-    OpenTelemetry unregisters this hook only after its own shutdown completes.
-    DeerFlow's bounded Gateway shutdown uses a daemon thread, so retaining the
-    hook could otherwise make interpreter exit block on the same provider.
-    """
-    handler = getattr(tracer_provider, "_atexit_handler", None)
-    if handler is None:
-        return
-    try:
-        atexit.unregister(handler)
-    except Exception:
-        logger.exception("Phoenix tracing provider atexit hook could not be unregistered.")
-    finally:
-        tracer_provider._atexit_handler = None
-
-
-def _snapshot_openinference_instrumentors() -> list[_InstrumentorSnapshot]:
-    snapshots: list[_InstrumentorSnapshot] = []
-    for entry_point in importlib.metadata.entry_points(group="openinference_instrumentor"):
-        instrumentor = entry_point.load()()
-        snapshots.append(
-            _InstrumentorSnapshot(
-                instrumentor=instrumentor,
-                instance_state=dict(getattr(instrumentor, "__dict__", {})),
-                was_instrumented=bool(getattr(instrumentor, "_is_instrumented_by_opentelemetry", False)),
-            )
-        )
-    return snapshots
-
-
-def _reject_foreign_instrumentors(snapshots: list[_InstrumentorSnapshot]) -> None:
-    if any(snapshot.was_instrumented for snapshot in snapshots):
-        raise PhoenixTracingError("Phoenix tracing found an OpenInference instrumentor owned by a foreign provider.")
-
-
-def _rollback_instrumentors(snapshots: list[_InstrumentorSnapshot]) -> None:
-    for snapshot in reversed(snapshots):
-        try:
-            snapshot.instrumentor._uninstrument()
-        except Exception:
-            logger.exception("Phoenix tracing could not roll back a partially instrumented entry point.")
-        _restore_instrumentor_snapshot(snapshot)
-
-
-def _uninstrument_owned_instrumentors(snapshots: list[_InstrumentorSnapshot]) -> None:
-    for snapshot in reversed(snapshots):
-        try:
-            snapshot.instrumentor.uninstrument()
-        except Exception:
-            logger.exception("Phoenix tracing could not uninstrument an owned OpenInference entry point.")
-        _restore_instrumentor_snapshot(snapshot)
-
-
-def _restore_instrumentor_snapshot(snapshot: _InstrumentorSnapshot) -> None:
-    instance_state = getattr(snapshot.instrumentor, "__dict__", None)
-    if instance_state is not None:
-        instance_state.clear()
-        instance_state.update(snapshot.instance_state)
 
 
 def _config_key(config: PhoenixTracingConfig) -> _PhoenixConfigKey:
