@@ -183,8 +183,6 @@ def _install_fake_phoenix(
 
 
 def test_phoenix_initializer_is_idempotent_for_same_config(monkeypatch):
-    from openinference.instrumentation import config as real_openinference_config
-
     from deerflow.tracing.phoenix import ensure_phoenix_tracing_initialized
 
     with _initializer_isolation():
@@ -206,10 +204,8 @@ def test_phoenix_initializer_is_idempotent_for_same_config(monkeypatch):
             }
         ]
         assert sys.modules["phoenix.otel"].register is not None
-        assert real_openinference_config.OPENINFERENCE_HIDE_INPUTS == "OPENINFERENCE_HIDE_INPUTS"
-        assert real_openinference_config.OPENINFERENCE_HIDE_OUTPUTS == "OPENINFERENCE_HIDE_OUTPUTS"
-        assert os.environ["OPENINFERENCE_HIDE_INPUTS"] == "true"
-        assert os.environ["OPENINFERENCE_HIDE_OUTPUTS"] == "true"
+        assert "OPENINFERENCE_HIDE_INPUTS" not in os.environ
+        assert "OPENINFERENCE_HIDE_OUTPUTS" not in os.environ
         assert calls[0]["api_key"] == "phoenix-key"
 
 
@@ -355,27 +351,30 @@ def test_parent_compat_only_wraps_phoenix_owned_tracer_instance(monkeypatch):
         phoenix_provider.shutdown()
 
 
-def test_content_capture_disabled_sets_openinference_suppression(monkeypatch):
+def test_content_capture_disabled_does_not_mutate_environment(monkeypatch):
     from deerflow.tracing.phoenix import ensure_phoenix_tracing_initialized
 
     with _initializer_isolation():
         _install_fake_phoenix(monkeypatch, lambda **_kwargs: object())
 
+        before = {name: os.environ.get(name) for name in OPENINFERENCE_HIDE_NAMES}
         ensure_phoenix_tracing_initialized(_phoenix_config(capture_content=False))
 
-        for env_name in (
-            "OPENINFERENCE_HIDE_INPUTS",
-            "OPENINFERENCE_HIDE_OUTPUTS",
-            "OPENINFERENCE_HIDE_INPUT_MESSAGES",
-            "OPENINFERENCE_HIDE_OUTPUT_MESSAGES",
-            "OPENINFERENCE_HIDE_PROMPTS",
-            "OPENINFERENCE_HIDE_CHOICES",
-            "OPENINFERENCE_HIDE_INPUT_TEXT",
-            "OPENINFERENCE_HIDE_OUTPUT_TEXT",
-            "OPENINFERENCE_HIDE_LLM_INVOCATION_PARAMETERS",
-            "OPENINFERENCE_HIDE_LLM_TOOLS",
-        ):
-            assert os.environ[env_name] == "true"
+        assert {name: os.environ.get(name) for name in OPENINFERENCE_HIDE_NAMES} == before
+
+
+OPENINFERENCE_HIDE_NAMES = (
+    "OPENINFERENCE_HIDE_INPUTS",
+    "OPENINFERENCE_HIDE_OUTPUTS",
+    "OPENINFERENCE_HIDE_INPUT_MESSAGES",
+    "OPENINFERENCE_HIDE_OUTPUT_MESSAGES",
+    "OPENINFERENCE_HIDE_PROMPTS",
+    "OPENINFERENCE_HIDE_CHOICES",
+    "OPENINFERENCE_HIDE_INPUT_TEXT",
+    "OPENINFERENCE_HIDE_OUTPUT_TEXT",
+    "OPENINFERENCE_HIDE_LLM_INVOCATION_PARAMETERS",
+    "OPENINFERENCE_HIDE_LLM_TOOLS",
+)
 
 
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
