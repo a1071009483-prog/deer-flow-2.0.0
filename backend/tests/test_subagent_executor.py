@@ -2122,10 +2122,21 @@ class TestSubagentTracingWiring:
         monkeypatch.setenv("PHOENIX_TRACING", "true")
         monkeypatch.setenv("PHOENIX_PROJECT_NAME", "deer-flow-tests")
         monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.test:6006")
+        monkeypatch.setenv("PHOENIX_METADATA_ALLOWLIST", "session_id")
         from deerflow.config.tracing_config import reset_tracing_config
 
         reset_tracing_config()
         monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: [])
+
+        # Inject caller metadata that Phoenix safe mode would previously have removed.
+        original_inject = executor_module.inject_trace_metadata
+
+        def _inject_with_private(run_config, **kwargs):
+            run_config.setdefault("metadata", {})
+            run_config["metadata"]["private"] = {"values": [1, 2, 3]}
+            return original_inject(run_config, **kwargs)
+
+        monkeypatch.setattr(executor_module, "inject_trace_metadata", _inject_with_private)
 
         recorded_roots = []
         with self._recorded_root_context(recorded_roots) as fake_activate:
@@ -2150,7 +2161,21 @@ class TestSubagentTracingWiring:
         assert root.user_id == "alice"
         assert root.tags == ["subagent:general_purpose"]
         assert root.upstream_context is None
-        assert root.metadata == {
+        # Canonical metadata preserves caller values, including nested private ones.
+        expected_canonical_metadata = {
+            "session_id": "thread-trace-1",
+            "thread_id": "thread-trace-1",
+            "user_id": "alice",
+            "assistant_id": "subagent:general-purpose",
+            "model_name": "claude-sonnet",
+            "environment": None,
+            "root_run_name": "subagent:general-purpose",
+            "caller_tags": ["subagent:general_purpose"],
+            "private": {"values": [1, 2, 3]},
+        }
+        assert root.metadata == expected_canonical_metadata
+        # Phoenix export view is filtered to the allowlist plus server-owned fields.
+        expected_correlation_metadata = {
             "session_id": "thread-trace-1",
             "thread_id": "thread-trace-1",
             "user_id": "alice",
@@ -2160,7 +2185,7 @@ class TestSubagentTracingWiring:
             "root_run_name": "subagent:general-purpose",
             "caller_tags": ["subagent:general_purpose"],
         }
-        assert root.correlation_metadata == root.metadata
+        assert root.correlation_metadata == expected_correlation_metadata
         assert root.correlation_tags == ["subagent:general_purpose"]
 
     @pytest.mark.anyio

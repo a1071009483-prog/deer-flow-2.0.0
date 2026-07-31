@@ -834,8 +834,8 @@ async def test_capture_content_disabled_filters_caller_metadata_from_phoenix(mon
 
 
 @pytest.mark.asyncio
-async def test_safe_mode_rebuilds_astream_metadata_after_effective_model_resolution(monkeypatch):
-    """Factory mutations must not drift auto metadata from the Phoenix root."""
+async def test_safe_mode_preserves_astream_metadata_after_effective_model_resolution(monkeypatch):
+    """Factory-appended business metadata must reach astream unchanged; Phoenix export stays filtered."""
     from deerflow.config.tracing_config import reset_tracing_config
 
     monkeypatch.setenv("PHOENIX_TRACING", "true")
@@ -848,18 +848,18 @@ async def test_safe_mode_rebuilds_astream_metadata_after_effective_model_resolut
     _install_fake_openinference_runtime(monkeypatch, using_attributes_calls=using_attributes_calls, spans=spans)
 
     fake_agent = _FakeAgent()
-    fake_agent.metadata = {"model_name": "resolved-model"}
+    factory_fields = {
+        "agent_name": "lead-agent",
+        "model_name": "resolved-model",
+        "tool_groups": ["web"],
+        "available_skills": ["research"],
+    }
 
     def agent_factory(config):
         # RunnableConfig performs a shallow copy, so these mutations model fields
         # appended by a real factory after model resolution.
-        config["metadata"].update(
-            {
-                "agent_name": "lead-agent",
-                "tool_groups": ["web"],
-                "available_skills": ["research"],
-            }
-        )
+        config["metadata"].update(factory_fields)
+        fake_agent.metadata = {"model_name": "resolved-model"}
         return fake_agent
 
     record = RunRecord(
@@ -885,7 +885,7 @@ async def test_safe_mode_rebuilds_astream_metadata_after_effective_model_resolut
         },
     )
 
-    expected_metadata = {
+    expected_export_metadata = {
         "request_id": "request-effective-model",
         "session_id": "thread-effective-model",
         "thread_id": "thread-effective-model",
@@ -898,8 +898,14 @@ async def test_safe_mode_rebuilds_astream_metadata_after_effective_model_resolut
         "run_id": "run-effective-model",
     }
     assert fake_agent.captured_config is not None
-    assert fake_agent.captured_config.get("metadata") == expected_metadata
-    assert using_attributes_calls[0]["metadata"] == expected_metadata
+    # The config consumed by LangGraph/business code preserves the caller metadata
+    # plus the factory fields; it is NOT replaced by the Phoenix export view.
+    assert fake_agent.captured_config.get("metadata") == {
+        "request_id": "request-effective-model",
+        **factory_fields,
+    }
+    # The Phoenix export view remains filtered to the allowlist plus server-owned fields.
+    assert using_attributes_calls[0]["metadata"] == expected_export_metadata
     assert "metadata" not in spans[0].attributes
 
 
