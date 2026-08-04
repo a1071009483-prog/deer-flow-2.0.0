@@ -44,7 +44,6 @@ def _copy_phoenix_export_value(key: str, value: Any) -> Any:
             "Skipping Phoenix metadata field %s because %s cannot be copied or serialized.",
             key,
             type(value).__name__,
-            exc_info=True,
         )
         return _UNEXPORTABLE
 

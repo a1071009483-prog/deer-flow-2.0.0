@@ -280,7 +280,28 @@ def test_phoenix_export_builder_skips_uncopyable_allowlisted_value(monkeypatch):
     assert exported["thread_id"] == "thread-1"
 
 
-def test_phoenix_export_builder_skips_circular_full_capture_value(monkeypatch):
+def test_phoenix_export_logging_does_not_leak_field_exceptions(caplog, monkeypatch):
+    _enable_phoenix(monkeypatch)
+    monkeypatch.setenv("PHOENIX_CAPTURE_CONTENT", "false")
+    monkeypatch.setenv("PHOENIX_METADATA_ALLOWLIST", "bad")
+    from deerflow.config.tracing_config import reset_tracing_config
+
+    reset_tracing_config()
+
+    class _LeakyUncopyable:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("SECRET_FROM_METADATA")
+
+    source = {"bad": _LeakyUncopyable()}
+    with caplog.at_level("WARNING", logger="deerflow.tracing.metadata"):
+        tracing_metadata.build_phoenix_correlation_metadata(
+            thread_id="thread-1",
+            caller_metadata=source,
+        )
+
+    assert any("Skipping Phoenix metadata field bad" in rec.message for rec in caplog.records)
+    assert "SECRET_FROM_METADATA" not in caplog.text
+
     _enable_phoenix(monkeypatch)
     monkeypatch.setenv("PHOENIX_CAPTURE_CONTENT", "true")
     from deerflow.config.tracing_config import reset_tracing_config
