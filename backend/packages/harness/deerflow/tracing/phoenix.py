@@ -24,7 +24,15 @@ from deerflow.tracing.otel_context import (
     capture_trace_context_from_span_context,
 )
 
-type _PhoenixConfigKey = tuple[str, str, bool, bool, bool, str | None]
+type _PhoenixConfigKey = tuple[
+    str,
+    str,
+    bool,
+    bool,
+    bool,
+    str | None,
+    tuple[str, ...],
+]
 
 _SAFE_MODE_DROP_KEY_MARKERS = (
     "retrieval.documents",
@@ -555,6 +563,7 @@ def _config_key(config: PhoenixTracingConfig) -> _PhoenixConfigKey:
         config.capture_content,
         api_key is not None,
         api_key,
+        tuple(config.metadata_allowlist),
     )
 
 

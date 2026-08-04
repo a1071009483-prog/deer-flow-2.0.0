@@ -16,7 +16,12 @@ from deerflow.config.tracing_config import PhoenixTracingConfig
 from deerflow.tracing.phoenix import DeerFlowTraceConfig
 
 
-def _config(*, auto_instrument: bool = False, capture_content: bool = True) -> PhoenixTracingConfig:
+def _config(
+    *,
+    auto_instrument: bool = False,
+    capture_content: bool = True,
+    metadata_allowlist: tuple[str, ...] = (),
+) -> PhoenixTracingConfig:
     return PhoenixTracingConfig(
         enabled=True,
         collector_endpoint="http://127.0.0.1:9",
@@ -24,6 +29,7 @@ def _config(*, auto_instrument: bool = False, capture_content: bool = True) -> P
         project_name="deer-flow-provider-lifecycle-test",
         auto_instrument=auto_instrument,
         capture_content=capture_content,
+        metadata_allowlist=metadata_allowlist,
         trace_parent_mode="root",
         trace_parent_required=False,
         propagate_baggage=False,
@@ -195,6 +201,15 @@ def test_registers_an_isolated_batch_provider_with_shutdown_on_exit_disabled(
     assert processor._schedule_delay_millis == 31
     assert processor._export_timeout_millis == 47
     assert processor._max_export_batch_size == 16
+
+
+def test_config_key_changes_when_metadata_allowlist_changes():
+    from deerflow.tracing import phoenix
+
+    without_allowlist = phoenix._config_key(_config(metadata_allowlist=()))
+    with_allowlist = phoenix._config_key(_config(metadata_allowlist=("request_id",)))
+
+    assert without_allowlist != with_allowlist
 
 
 def test_manual_root_uses_the_saved_phoenix_provider(monkeypatch, _reject_entry_point_enumeration):
