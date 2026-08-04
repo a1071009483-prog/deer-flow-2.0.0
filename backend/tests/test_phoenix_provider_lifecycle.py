@@ -13,7 +13,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 
 from deerflow.config.tracing_config import PhoenixTracingConfig
-from deerflow.tracing.phoenix import DeerFlowTraceConfig
+from deerflow.tracing.phoenix import DeerFlowTraceConfig, PhoenixRootContext
 
 
 def _config(
@@ -229,6 +229,59 @@ def test_manual_root_uses_the_saved_phoenix_provider(monkeypatch, _reject_entry_
 
     assert provider.tracer_names == ["deerflow.tracing.phoenix"]
     assert trace.get_tracer_provider() is host_provider
+
+
+def test_manual_root_uses_cleaned_caller_metadata_in_full_capture(monkeypatch, _reject_entry_point_enumeration):
+    """Full capture must pass a cleaned copy of caller metadata, not the raw dict."""
+    from deerflow.tracing import phoenix
+    from deerflow.tracing.phoenix import activate_phoenix_root_context
+
+    class _Uncopyable:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("copy boom")
+
+    provider = _RecordingProvider()
+    host_provider = TracerProvider()
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", host_provider)
+    monkeypatch.setattr("phoenix.otel.register", lambda **_kwargs: provider)
+    monkeypatch.setattr(
+        phoenix,
+        "get_tracing_config",
+        lambda: SimpleNamespace(phoenix=_config(capture_content=True)),
+    )
+    _install_openinference_runtime(monkeypatch)
+
+    captured: dict[str, Any] = {}
+
+    import openinference.instrumentation
+
+    real_using_attributes = openinference.instrumentation.using_attributes
+
+    def _recording_using_attributes(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_using_attributes(**kwargs)
+
+    monkeypatch.setattr(
+        openinference.instrumentation,
+        "using_attributes",
+        _recording_using_attributes,
+    )
+
+    phoenix.ensure_phoenix_tracing_initialized(_config(capture_content=True))
+    root = PhoenixRootContext(
+        run_name="full-capture-correlation",
+        session_id="thread",
+        user_id="user",
+        metadata={"raw": "caller", "extra": "should-not-be-used", "bad": _Uncopyable()},
+        tags=["caller"],
+        correlation_metadata={"safe": "correlation"},
+        correlation_tags=["safe"],
+    )
+    with activate_phoenix_root_context(root):
+        pass
+
+    assert captured.get("metadata") == {"raw": "caller", "extra": "should-not-be-used"}
+    assert captured.get("tags") == ["caller"]
 
 
 def test_auto_instrumented_tracer_and_manual_root_share_the_phoenix_provider(

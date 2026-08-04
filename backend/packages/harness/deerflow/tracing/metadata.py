@@ -48,6 +48,33 @@ def _copy_phoenix_export_value(key: str, value: Any) -> Any:
         return _UNEXPORTABLE
 
 
+def _copy_caller_metadata_for_export(
+    caller_metadata: dict[str, Any] | None,
+    *,
+    capture_content: bool,
+    allowlist: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Return a deep, JSON-stable copy of caller metadata for Phoenix export.
+
+    When ``capture_content`` is true every caller key except reserved prefixes
+    is copied.  In safe mode only ``allowlist`` keys are copied.  Values that
+    cannot be deep-copied or serialized are dropped per-field.
+    """
+    if caller_metadata is None:
+        return {}
+    result: dict[str, Any] = {}
+    keys = caller_metadata.keys() if capture_content else (allowlist or ())
+    for key in keys:
+        if key.startswith(_OTHER_PROVIDER_RESERVED_METADATA_PREFIXES):
+            continue
+        if key not in caller_metadata:
+            continue
+        copied = _copy_phoenix_export_value(key, caller_metadata[key])
+        if copied is not _UNEXPORTABLE:
+            result[key] = copied
+    return result
+
+
 def _build_langfuse_trace_metadata_unchecked(
     *,
     thread_id: str | None,

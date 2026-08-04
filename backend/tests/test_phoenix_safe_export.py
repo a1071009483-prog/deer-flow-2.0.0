@@ -11,6 +11,7 @@ establishes in production.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from uuid import uuid4
 
@@ -24,7 +25,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from deerflow.tracing.phoenix import DeerFlowTraceConfig
+from deerflow.tracing.phoenix import DeerFlowTraceConfig, _trusted_metadata_context
 
 _PROMPT_TEMPLATE_SERIALIZED = {
     "id": ["langchain", "prompts", "prompt", "PromptTemplate"],
@@ -123,12 +124,21 @@ def _drive_function_call(tracer) -> str:
     return "fc-llm"
 
 
-def _drive_metadata_collision(tracer, *, context_metadata: dict[str, str]) -> str:
+def _drive_metadata_collision(
+    tracer,
+    *,
+    context_metadata: dict[str, str],
+    set_trusted: bool = True,
+) -> str:
     run_id = uuid4()
-    with using_attributes(
-        session_id="deerflow-session",
-        user_id="deerflow-user",
-        metadata=context_metadata,
+    trusted_cm = _trusted_metadata_context(context_metadata) if set_trusted else contextlib.nullcontext()
+    with (
+        using_attributes(
+            session_id="deerflow-session",
+            user_id="deerflow-user",
+            metadata=context_metadata,
+        ),
+        trusted_cm,
     ):
         tracer.on_chain_start(
             {"name": "chain"},
@@ -238,3 +248,77 @@ def test_safe_export_keeps_server_correlation_with_empty_allowlist(export_runtim
     assert span.attributes["session.id"] == "deerflow-session"
     assert span.attributes["user.id"] == "deerflow-user"
     assert json.loads(span.attributes["metadata"]) == _SERVER_CORRELATION
+
+
+def test_safe_export_generic_openinference_metadata_is_not_trusted(export_runtime):
+    """Generic OpenInference context metadata must still respect the exact allowlist."""
+    exporter, tracer = export_runtime(
+        capture_content=False,
+        metadata_allowlist=(),
+    )
+    span = _finished(
+        exporter,
+        _drive_metadata_collision(
+            tracer,
+            context_metadata={"private": "leaked"},
+            set_trusted=False,
+        ),
+    )
+
+    assert "private" not in span.attributes.get("metadata", "{}")
+
+
+def test_full_capture_boundary_child_span_uses_cleaned_correlation_metadata(
+    monkeypatch,
+    export_runtime,
+):
+    """Production boundary must put the sanitized correlation view into OpenInference context."""
+    from deerflow.config.tracing_config import reset_tracing_config
+    from deerflow.tracing.phoenix import (
+        PhoenixRootContext,
+        activate_phoenix_root_context,
+        reset_phoenix_tracing_for_tests,
+        shutdown_phoenix_tracing,
+    )
+
+    shutdown_phoenix_tracing()
+    reset_phoenix_tracing_for_tests()
+
+    monkeypatch.setattr("phoenix.otel.register", lambda **_kwargs: TracerProvider())
+    monkeypatch.setenv("PHOENIX_TRACING", "true")
+    monkeypatch.setenv("PHOENIX_CAPTURE_CONTENT", "true")
+    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+    monkeypatch.setenv("PHOENIX_PROJECT_NAME", "deer-flow-test")
+    reset_tracing_config()
+
+    exporter, tracer = export_runtime(capture_content=True)
+
+    circular: dict[str, object] = {}
+    circular["self"] = circular
+    root = PhoenixRootContext(
+        run_name="full-capture-boundary",
+        session_id="thread-boundary",
+        user_id="user-boundary",
+        metadata={"circular": circular, "private": "leaked"},
+        tags=["raw-tag"],
+        correlation_metadata={"safe": "correlation", "request_id": "request-1"},
+        correlation_tags=["safe-tag"],
+    )
+    with activate_phoenix_root_context(root):
+        run_id = uuid4()
+        tracer.on_chain_start(
+            {"name": "chain"},
+            {"input": "x"},
+            run_id=run_id,
+            name="chain",
+        )
+        tracer.on_chain_end({"output": "y"}, run_id=run_id)
+
+    span = _finished(exporter, "chain")
+    metadata = json.loads(span.attributes["metadata"])
+    assert metadata.get("safe") == "correlation"
+    assert metadata.get("request_id") == "request-1"
+    assert "circular" not in metadata
+
+    shutdown_phoenix_tracing()
+    reset_phoenix_tracing_for_tests()

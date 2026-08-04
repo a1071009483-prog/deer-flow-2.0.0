@@ -40,6 +40,24 @@ _SAFE_MODE_DROP_KEY_MARKERS = (
     "llm.function_call",
 )
 
+_TRUSTED_METADATA_CONTEXT_KEY = "deerflow.tracing.trusted_metadata"
+
+
+@contextmanager
+def _trusted_metadata_context(metadata: dict[str, Any]) -> Iterator[None]:
+    """Attach DeerFlow's trusted metadata under a private context key.
+
+    This key is only set by DeerFlow's own run boundary, so it cannot be
+    forged by nested or third-party OpenInference instrumentation.
+    """
+    from opentelemetry import context as otel_context
+
+    token = otel_context.attach(otel_context.set_value(_TRUSTED_METADATA_CONTEXT_KEY, metadata))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
 
 class DeerFlowTraceConfig(oi_config.TraceConfig):
     """Instance-local safe-capture policy for DeerFlow's Phoenix export.
@@ -102,7 +120,8 @@ class DeerFlowTraceConfig(oi_config.TraceConfig):
         return masked
 
     def _mask_metadata(self, masked: Any) -> Any:
-        trusted = self._context_metadata() or {}
+        trusted = self._trusted_metadata() or {}
+        context_metadata = self._context_metadata() or {}
         try:
             decoded = json.loads(masked)
         except (TypeError, ValueError):
@@ -110,14 +129,19 @@ class DeerFlowTraceConfig(oi_config.TraceConfig):
         if not isinstance(decoded, dict):
             return masked if self._deerflow_capture_content else None
         if self._deerflow_capture_content:
-            if trusted:
-                decoded = {**decoded, **trusted}
-                return json.dumps(decoded, sort_keys=True, separators=(",", ":"))
+            if context_metadata or trusted:
+                merged = {**decoded, **context_metadata, **trusted}
+                return json.dumps(merged, sort_keys=True, separators=(",", ":"))
             return masked
 
-        filtered = {name: item for name, item in decoded.items() if name in self._deerflow_metadata_allowlist and not name.startswith("langfuse_")}
+        merged = {**decoded, **context_metadata}
+        filtered = {name: item for name, item in merged.items() if name in self._deerflow_metadata_allowlist and not name.startswith("langfuse_")}
         filtered.update(trusted)
         return json.dumps(filtered, sort_keys=True, separators=(",", ":")) if filtered else None
+
+    def _trusted_metadata(self) -> dict[str, Any] | None:
+        raw = self._context_value(_TRUSTED_METADATA_CONTEXT_KEY)
+        return raw if isinstance(raw, dict) else None
 
     def _context_metadata(self) -> dict[str, Any] | None:
         raw = self._context_value(SpanAttributes.METADATA)
@@ -381,10 +405,25 @@ def activate_phoenix_root_context(root: PhoenixRootContext) -> Iterator[PhoenixR
     except Exception as exc:
         raise PhoenixTracingError(f"Phoenix root context activation failed: {exc}") from exc
 
-    token = otel_context.attach(resolved_context)
+    if phoenix_config.capture_content:
+        from deerflow.tracing import metadata as tracing_metadata
 
-    export_metadata = root.metadata if phoenix_config.capture_content else root.correlation_metadata
-    export_tags = root.tags if phoenix_config.capture_content else root.correlation_tags
+        export_metadata = tracing_metadata._copy_caller_metadata_for_export(
+            root.metadata,
+            capture_content=True,
+        )
+        export_tags = root.tags
+    else:
+        export_metadata = root.correlation_metadata
+        export_tags = root.correlation_tags
+
+    token = otel_context.attach(
+        otel_context.set_value(
+            _TRUSTED_METADATA_CONTEXT_KEY,
+            root.correlation_metadata,
+            context=resolved_context,
+        )
+    )
 
     try:
         with using_attributes(
@@ -450,8 +489,17 @@ class PhoenixRootScope:
         except Exception as exc:
             raise PhoenixTracingError(f"Phoenix root scope start failed: {exc}") from exc
 
-        export_metadata = self._root.metadata if phoenix_config.capture_content else self._root.correlation_metadata
-        export_tags = self._root.tags if phoenix_config.capture_content else self._root.correlation_tags
+        if phoenix_config.capture_content:
+            from deerflow.tracing import metadata as tracing_metadata
+
+            export_metadata = tracing_metadata._copy_caller_metadata_for_export(
+                self._root.metadata,
+                capture_content=True,
+            )
+            export_tags = self._root.tags
+        else:
+            export_metadata = self._root.correlation_metadata
+            export_tags = self._root.correlation_tags
 
         tracer = _get_phoenix_tracer(__name__)
         span = tracer.start_span(_RUN_BOUNDARY_SPAN_NAME, context=resolved_context)
@@ -467,7 +515,12 @@ class PhoenixRootScope:
         )
 
         base_context = otel_trace.set_span_in_context(span, resolved_context)
-        token = otel_context.attach(base_context)
+        context_with_trusted = otel_context.set_value(
+            _TRUSTED_METADATA_CONTEXT_KEY,
+            self._root.correlation_metadata,
+            context=base_context,
+        )
+        token = otel_context.attach(context_with_trusted)
         try:
             with using_attributes(
                 session_id=self._root.session_id,
