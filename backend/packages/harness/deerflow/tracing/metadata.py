@@ -17,15 +17,36 @@ right metadata without leaking Langfuse internals into the call sites.
 from __future__ import annotations
 
 import copy
+import json
+import logging
 from typing import Any
 
 from deerflow.config import get_enabled_tracing_providers
 from deerflow.config.tracing_config import get_tracing_config
 
+logger = logging.getLogger(__name__)
+_UNEXPORTABLE = object()
+
+
 # Lazy-imported below to avoid a circular import: ``deerflow.runtime`` eagerly
 # imports the run worker, which in turn needs ``deerflow.tracing``.
 _DEFAULT_TRACE_NAME = "lead-agent"
 _OTHER_PROVIDER_RESERVED_METADATA_PREFIXES = ("langfuse_",)
+
+
+def _copy_phoenix_export_value(key: str, value: Any) -> Any:
+    try:
+        copied = copy.deepcopy(value)
+        serialized = json.dumps(copied, default=str, ensure_ascii=False)
+        return json.loads(serialized)
+    except Exception:
+        logger.warning(
+            "Skipping Phoenix metadata field %s because %s cannot be copied or serialized.",
+            key,
+            type(value).__name__,
+            exc_info=True,
+        )
+        return _UNEXPORTABLE
 
 
 def _build_langfuse_trace_metadata_unchecked(
@@ -113,11 +134,16 @@ def build_phoenix_correlation_metadata(
         if phoenix_config.capture_content:
             for key, value in caller_metadata.items():
                 if not key.startswith(_OTHER_PROVIDER_RESERVED_METADATA_PREFIXES):
-                    metadata[key] = copy.deepcopy(value)
+                    copied = _copy_phoenix_export_value(key, value)
+                    if copied is not _UNEXPORTABLE:
+                        metadata[key] = copied
         else:
             for key in phoenix_config.metadata_allowlist:
                 if key in caller_metadata and not key.startswith(_OTHER_PROVIDER_RESERVED_METADATA_PREFIXES):
-                    metadata[key] = copy.deepcopy(caller_metadata[key])
+                    value = caller_metadata[key]
+                    copied = _copy_phoenix_export_value(key, value)
+                    if copied is not _UNEXPORTABLE:
+                        metadata[key] = copied
     metadata.update(
         {
             "session_id": thread_id,

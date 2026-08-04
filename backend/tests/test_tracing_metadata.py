@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -251,3 +252,50 @@ def test_phoenix_export_builder_copies_nested_values(monkeypatch):
     assert exported["private"] is not source["private"]
     exported["private"]["values"].append(3)
     assert source["private"] == {"values": [1, 2]}
+
+
+class _Uncopyable:
+    def __deepcopy__(self, memo):
+        raise RuntimeError("copy boom")
+
+
+def test_phoenix_export_builder_skips_uncopyable_allowlisted_value(monkeypatch):
+    _enable_phoenix(monkeypatch)
+    monkeypatch.setenv("PHOENIX_CAPTURE_CONTENT", "false")
+    monkeypatch.setenv("PHOENIX_METADATA_ALLOWLIST", "request_id,bad")
+    from deerflow.config.tracing_config import reset_tracing_config
+
+    reset_tracing_config()
+    bad = _Uncopyable()
+    source = {"request_id": "request-1", "bad": bad}
+
+    exported = tracing_metadata.build_phoenix_correlation_metadata(
+        thread_id="thread-1",
+        caller_metadata=source,
+    )
+
+    assert exported["request_id"] == "request-1"
+    assert "bad" not in exported
+    assert source["bad"] is bad
+    assert exported["thread_id"] == "thread-1"
+
+
+def test_phoenix_export_builder_skips_circular_full_capture_value(monkeypatch):
+    _enable_phoenix(monkeypatch)
+    monkeypatch.setenv("PHOENIX_CAPTURE_CONTENT", "true")
+    from deerflow.config.tracing_config import reset_tracing_config
+
+    reset_tracing_config()
+    circular: dict[str, object] = {}
+    circular["self"] = circular
+    source = {"request_id": "request-1", "circular": circular}
+
+    exported = tracing_metadata.build_phoenix_correlation_metadata(
+        thread_id="thread-1",
+        caller_metadata=source,
+    )
+
+    assert exported["request_id"] == "request-1"
+    assert "circular" not in exported
+    assert source["circular"] is circular
+    json.dumps(exported, default=str, ensure_ascii=False)
