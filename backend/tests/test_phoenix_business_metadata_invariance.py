@@ -8,6 +8,9 @@ unchanged and must not alter the effective tools/skills available to a subagent.
 from __future__ import annotations
 
 import asyncio
+import importlib
+from enum import Enum
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -18,6 +21,17 @@ from deerflow.runtime.runs.manager import RunRecord
 from deerflow.runtime.runs.schemas import DisconnectMode, RunStatus
 from deerflow.runtime.runs.worker import RunContext, run_agent
 from deerflow.subagents.config import SubagentConfig
+
+task_tool_module = importlib.import_module("deerflow.tools.builtins.task_tool")
+
+
+class _SubagentStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
 
 
 class _FakeAgent:
@@ -158,9 +172,22 @@ async def test_worker_authorization_is_invariant_across_phoenix_modes(
     assert captured_metadata["tool_groups"] == ["web"]
     assert captured_metadata["available_skills"] == ["research"]
 
-    # Simulate the task-tool authorization boundary using the exact runtime config
-    # the agent received. This avoids exercising the full task-tool polling loop
-    # while proving that tool_groups/available_skills reach the subagent resolver.
+    runtime = SimpleNamespace(
+        state={
+            "sandbox": {"sandbox_id": "local"},
+            "thread_data": {"workspace_path": "/tmp/workspace"},
+        },
+        context={"thread_id": "thread-auth-invariance"},
+        config=fake_agent.captured_config,
+    )
+
+    subagent_config = SubagentConfig(
+        name="general-purpose",
+        description="General helper",
+        system_prompt="Base system prompt",
+        max_turns=50,
+        timeout_seconds=10,
+    )
     get_available_tools = MagicMock(return_value=["tool-a"])
     executor_captured: dict[str, Any] = {}
 
@@ -169,32 +196,60 @@ async def test_worker_authorization_is_invariant_across_phoenix_modes(
             executor_captured["kwargs"] = kwargs
 
         def execute_async(self, prompt, task_id=None):
+            executor_captured["prompt"] = prompt
             return task_id or "generated-task-id"
 
-    monkeypatch.setattr("deerflow.tools.get_available_tools", get_available_tools)
-
-    # These are the same metadata reads performed by task_tool.
-    parent_model = captured_metadata.get("model_name")
-    parent_tool_groups = captured_metadata.get("tool_groups")
-    parent_available_skills = captured_metadata.get("available_skills")
-
-    get_available_tools(parent_model, groups=parent_tool_groups, subagent_enabled=False)
-    DummyExecutor(
-        config=SubagentConfig(
-            name="general-purpose",
-            description="General helper",
-            system_prompt="Base system prompt",
-            max_turns=50,
-            timeout_seconds=10,
-        ),
-        tools=["tool-a"],
-        parent_model=parent_model,
-        skills=parent_available_skills,
+    completed = SimpleNamespace(
+        status=_SubagentStatus.COMPLETED,
+        ai_messages=[],
+        result="done",
+        error=None,
+        token_usage_records=[],
+        usage_reported=False,
     )
 
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", _SubagentStatus)
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_subagent_config",
+        lambda _name: subagent_config,
+    )
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_available_subagent_names",
+        lambda: ["general-purpose"],
+    )
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _task_id: completed,
+    )
+    monkeypatch.setattr(task_tool_module, "cleanup_background_task", lambda _task_id: None)
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: lambda _event: None)
+    monkeypatch.setattr(
+        task_tool_module,
+        "_token_usage_cache_enabled",
+        lambda _app_config: False,
+    )
+    monkeypatch.setattr("deerflow.tools.get_available_tools", get_available_tools)
+
+    task_coroutine = task_tool_module.task_tool.coroutine
+    assert task_coroutine is not None
+    result = await task_coroutine(
+        runtime=runtime,
+        description="验证授权",
+        prompt="perform authorized work",
+        subagent_type="general-purpose",
+        tool_call_id="tc-auth-invariance",
+    )
+
+    assert result == "Task Succeeded. Result: done"
     get_available_tools.assert_called_once_with(
-        "resolved-model",
+        model_name="resolved-model",
         groups=["web"],
         subagent_enabled=False,
     )
-    assert executor_captured["kwargs"]["skills"] == ["research"]
+    assert executor_captured["kwargs"]["tools"] == ["tool-a"]
+    assert executor_captured["kwargs"]["config"].skills == ["research"]
+    assert executor_captured["kwargs"]["parent_model"] == "resolved-model"
