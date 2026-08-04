@@ -94,20 +94,21 @@ class DeerFlowTraceConfig(oi_config.TraceConfig):
         return masked
 
     def _mask_metadata(self, masked: Any) -> Any:
-        trusted = self._context_metadata()
+        trusted = self._context_metadata() or {}
         try:
             decoded = json.loads(masked)
         except (TypeError, ValueError):
             decoded = None
         if not isinstance(decoded, dict):
             return masked if self._deerflow_capture_content else None
-        if trusted:
-            decoded = {**decoded, **trusted}
         if self._deerflow_capture_content:
             if trusted:
+                decoded = {**decoded, **trusted}
                 return json.dumps(decoded, sort_keys=True, separators=(",", ":"))
             return masked
+
         filtered = {name: item for name, item in decoded.items() if name in self._deerflow_metadata_allowlist and not name.startswith("langfuse_")}
+        filtered.update(trusted)
         return json.dumps(filtered, sort_keys=True, separators=(",", ":")) if filtered else None
 
     def _context_metadata(self) -> dict[str, Any] | None:

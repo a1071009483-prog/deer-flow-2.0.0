@@ -31,6 +31,17 @@ _PROMPT_TEMPLATE_SERIALIZED = {
     "kwargs": {"template": "Tell me about {topic}", "input_variables": ["topic"]},
 }
 
+_SERVER_CORRELATION = {
+    "session_id": "deerflow-session",
+    "thread_id": "deerflow-thread",
+    "user_id": "deerflow-user",
+    "assistant_id": "deerflow-assistant",
+    "model_name": "deerflow-model",
+    "environment": "test",
+    "root_run_name": "deerflow.run",
+    "run_id": "deerflow-run",
+}
+
 
 @pytest.fixture
 def export_runtime():
@@ -112,12 +123,12 @@ def _drive_function_call(tracer) -> str:
     return "fc-llm"
 
 
-def _drive_metadata_collision(tracer) -> str:
+def _drive_metadata_collision(tracer, *, context_metadata: dict[str, str]) -> str:
     run_id = uuid4()
     with using_attributes(
         session_id="deerflow-session",
         user_id="deerflow-user",
-        metadata={"request_id": "deerflow-request"},
+        metadata=context_metadata,
     ):
         tracer.on_chain_start(
             {"name": "chain"},
@@ -126,8 +137,13 @@ def _drive_metadata_collision(tracer) -> str:
             name="chain",
             metadata={
                 "session_id": "caller-session",
-                "conversation_id": "caller-conversation",
                 "thread_id": "caller-thread",
+                "user_id": "caller-user",
+                "assistant_id": "caller-assistant",
+                "model_name": "caller-model",
+                "environment": "caller-env",
+                "root_run_name": "caller-root",
+                "run_id": "caller-run",
                 "request_id": "caller-request",
                 "private": "caller-private",
             },
@@ -180,18 +196,45 @@ def test_full_export_keeps_function_call_arguments(export_runtime):
 
 def test_safe_export_caller_metadata_cannot_forge_session_or_correlation(export_runtime):
     exporter, tracer = export_runtime(capture_content=False, metadata_allowlist=("request_id",))
-    span = _finished(exporter, _drive_metadata_collision(tracer))
+    trusted = {**_SERVER_CORRELATION, "request_id": "deerflow-request"}
+    span = _finished(
+        exporter,
+        _drive_metadata_collision(tracer, context_metadata=trusted),
+    )
 
     assert span.attributes["session.id"] == "deerflow-session"
     assert span.attributes["user.id"] == "deerflow-user"
-    assert json.loads(span.attributes["metadata"]) == {"request_id": "deerflow-request"}
+    assert json.loads(span.attributes["metadata"]) == trusted
 
 
 def test_full_export_caller_metadata_cannot_override_trusted_correlation(export_runtime):
     exporter, tracer = export_runtime(capture_content=True)
-    span = _finished(exporter, _drive_metadata_collision(tracer))
+    trusted = {**_SERVER_CORRELATION, "request_id": "deerflow-request"}
+    span = _finished(
+        exporter,
+        _drive_metadata_collision(tracer, context_metadata=trusted),
+    )
 
     assert span.attributes["session.id"] == "deerflow-session"
     metadata = json.loads(span.attributes["metadata"])
-    assert metadata["request_id"] == "deerflow-request"
     assert metadata["private"] == "caller-private"
+    for key, value in trusted.items():
+        assert metadata[key] == value
+
+
+def test_safe_export_keeps_server_correlation_with_empty_allowlist(export_runtime):
+    exporter, tracer = export_runtime(
+        capture_content=False,
+        metadata_allowlist=(),
+    )
+    span = _finished(
+        exporter,
+        _drive_metadata_collision(
+            tracer,
+            context_metadata=dict(_SERVER_CORRELATION),
+        ),
+    )
+
+    assert span.attributes["session.id"] == "deerflow-session"
+    assert span.attributes["user.id"] == "deerflow-user"
+    assert json.loads(span.attributes["metadata"]) == _SERVER_CORRELATION
