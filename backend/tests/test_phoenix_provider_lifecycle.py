@@ -11,6 +11,8 @@ from unittest.mock import Mock
 import pytest
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from deerflow.config.tracing_config import PhoenixTracingConfig
 from deerflow.tracing.phoenix import DeerFlowTraceConfig, PhoenixRootContext
@@ -61,6 +63,42 @@ class _RecordingProvider(TracerProvider):
 
     def shutdown(self) -> None:
         self.events.append(("shutdown", None))
+
+
+class _PhoenixLikeProvider(TracerProvider):
+    """Provider that mimics phoenix.otel.TracerProvider's add_span_processor default.
+
+    Phoenix overrides ``add_span_processor`` so that ``replace_default_processor``
+    defaults to ``True``. Standard OpenTelemetry ``TracerProvider`` appends processors
+    and never replaces the default, so tests using it cannot catch accidental removal
+    of the export processor.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.add_processor_calls: list[tuple[Any, dict[str, Any]]] = []
+
+    def add_span_processor(
+        self,
+        *args: Any,
+        replace_default_processor: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        self.add_processor_calls.append((args, dict(replace_default_processor=replace_default_processor, **kwargs)))
+        if replace_default_processor:
+            # Mirror Phoenix: replace the current default processor with the new one.
+            from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+            if not args:
+                raise TypeError("add_span_processor requires a processor argument")
+            new_processor = args[0]
+            processors = list(self._active_span_processor._span_processors)
+            for processor in processors:
+                if not isinstance(processor, SimpleSpanProcessor):
+                    processor.shutdown()
+            self._active_span_processor._span_processors = [new_processor]
+        else:
+            super().add_span_processor(*args, **kwargs)
 
 
 class _FakeInstrumentor:
@@ -375,7 +413,10 @@ def test_owned_auto_instrumentor_installs_boundary_io_processor_for_full_capture
 ):
     from deerflow.tracing import phoenix
 
-    provider = _RecordingProvider()
+    exporter = InMemorySpanExporter()
+    provider = _PhoenixLikeProvider()
+    default_processor = SimpleSpanProcessor(exporter)
+    provider.add_span_processor(default_processor, replace_default_processor=False)
     fake_instrumentor = _FakeInstrumentor()
     monkeypatch.setattr("phoenix.otel.register", lambda **_kwargs: provider)
     monkeypatch.setattr(phoenix, "_validate_openinference_langchain_parent_contract", lambda: None)
@@ -384,9 +425,12 @@ def test_owned_auto_instrumentor_installs_boundary_io_processor_for_full_capture
 
     phoenix.ensure_phoenix_tracing_initialized(_config(auto_instrument=True, capture_content=True))
 
-    processors = _boundary_io_processors(provider)
-    assert len(processors) == 1
+    processors = provider._active_span_processor._span_processors
+    boundary_io_processors = [p for p in processors if isinstance(p, PhoenixBoundaryIOProcessor)]
+    assert len(boundary_io_processors) == 1
+    assert default_processor in processors
     assert fake_instrumentor.providers == [provider]
+    assert any(call_kwargs.get("replace_default_processor") is False for _args, call_kwargs in provider.add_processor_calls)
 
 
 def test_existing_host_langchain_instrumentor_is_left_unchanged(

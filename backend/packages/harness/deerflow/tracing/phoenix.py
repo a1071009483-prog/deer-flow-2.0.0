@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import threading
@@ -228,6 +229,19 @@ def _get_langchain_instrumentor() -> Any:
     return _langchain_instrumentor
 
 
+def _get_add_span_processor_params(method: Any) -> set[str]:
+    """Return the parameter names accepted by a provider's ``add_span_processor``.
+
+    Phoenix's ``TracerProvider`` extends the OTel signature with
+    ``replace_default_processor``; plain OTel providers do not. Inspecting the
+    signature lets DeerFlow pass the argument only when it is supported.
+    """
+    try:
+        return set(inspect.signature(method).parameters)
+    except Exception:
+        return set()
+
+
 @dataclass(frozen=True)
 class PhoenixRootContext:
     run_name: str
@@ -291,13 +305,16 @@ def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = Non
                 else:
                     logger.warning("Phoenix tracing left an existing host-owned LangChain instrumentor unchanged; only DeerFlow manual run spans are guaranteed on the Phoenix provider.")
             if phoenix_config.capture_content and owned_instrumentor is not None:
-                tracer_provider.add_span_processor(
-                    PhoenixBoundaryIOProcessor(
-                        boundary_span_name=_RUN_BOUNDARY_SPAN_NAME,
-                        boundary_instrumentation_scope=__name__,
-                        root_run_name_attribute="deerflow.root_run_name",
-                    )
+                boundary_processor = PhoenixBoundaryIOProcessor(
+                    boundary_span_name=_RUN_BOUNDARY_SPAN_NAME,
+                    boundary_instrumentation_scope=__name__,
+                    root_run_name_attribute="deerflow.root_run_name",
                 )
+                add_span_processor = tracer_provider.add_span_processor
+                if "replace_default_processor" in _get_add_span_processor_params(add_span_processor):
+                    add_span_processor(boundary_processor, replace_default_processor=False)
+                else:
+                    add_span_processor(boundary_processor)
         except Exception as exc:
             if owned_instrumentor is not None:
                 try:
