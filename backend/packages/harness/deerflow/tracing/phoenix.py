@@ -23,6 +23,7 @@ from deerflow.tracing.otel_context import (
     capture_current_trace_context,
     capture_trace_context_from_span_context,
 )
+from deerflow.tracing.phoenix_boundary_io import PhoenixBoundaryIOProcessor
 
 type _PhoenixConfigKey = tuple[
     str,
@@ -289,6 +290,14 @@ def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = Non
                     _install_openinference_langchain_parent_compat(tracer_provider)
                 else:
                     logger.warning("Phoenix tracing left an existing host-owned LangChain instrumentor unchanged; only DeerFlow manual run spans are guaranteed on the Phoenix provider.")
+            if phoenix_config.capture_content and owned_instrumentor is not None:
+                tracer_provider.add_span_processor(
+                    PhoenixBoundaryIOProcessor(
+                        boundary_span_name=_RUN_BOUNDARY_SPAN_NAME,
+                        boundary_instrumentation_scope=__name__,
+                        root_run_name_attribute="deerflow.root_run_name",
+                    )
+                )
         except Exception as exc:
             if owned_instrumentor is not None:
                 try:

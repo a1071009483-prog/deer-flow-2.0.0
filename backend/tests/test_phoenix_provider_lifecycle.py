@@ -14,6 +14,7 @@ from opentelemetry.sdk.trace import TracerProvider
 
 from deerflow.config.tracing_config import PhoenixTracingConfig
 from deerflow.tracing.phoenix import DeerFlowTraceConfig, PhoenixRootContext
+from deerflow.tracing.phoenix_boundary_io import PhoenixBoundaryIOProcessor
 
 
 def _config(
@@ -34,6 +35,10 @@ def _config(
         trace_parent_required=False,
         propagate_baggage=False,
     )
+
+
+def _boundary_io_processors(provider: TracerProvider) -> list[PhoenixBoundaryIOProcessor]:
+    return [processor for processor in provider._active_span_processor._span_processors if isinstance(processor, PhoenixBoundaryIOProcessor)]
 
 
 class _RecordingProvider(TracerProvider):
@@ -357,10 +362,31 @@ def test_auto_instrument_uses_langchain_instrumentor_with_deerflow_trace_config(
     assert passed_config._deerflow_capture_content is False
     assert passed_config._deerflow_metadata_allowlist == frozenset(_config().metadata_allowlist)
     assert phoenix._phoenix_owned_langchain_instrumentor is fake_instrumentor
+    assert _boundary_io_processors(provider) == []
 
     phoenix.shutdown_phoenix_tracing()
     assert fake_instrumentor.events == ["instrument", "uninstrument"]
     assert provider.events == [("force_flush", 30_000), ("shutdown", None)]
+
+
+def test_owned_auto_instrumentor_installs_boundary_io_processor_for_full_capture(
+    monkeypatch,
+    _reject_entry_point_enumeration,
+):
+    from deerflow.tracing import phoenix
+
+    provider = _RecordingProvider()
+    fake_instrumentor = _FakeInstrumentor()
+    monkeypatch.setattr("phoenix.otel.register", lambda **_kwargs: provider)
+    monkeypatch.setattr(phoenix, "_validate_openinference_langchain_parent_contract", lambda: None)
+    monkeypatch.setattr(phoenix, "_install_openinference_langchain_parent_compat", lambda _provider: None)
+    monkeypatch.setattr(phoenix, "_get_langchain_instrumentor", lambda: lambda: fake_instrumentor)
+
+    phoenix.ensure_phoenix_tracing_initialized(_config(auto_instrument=True, capture_content=True))
+
+    processors = _boundary_io_processors(provider)
+    assert len(processors) == 1
+    assert fake_instrumentor.providers == [provider]
 
 
 def test_existing_host_langchain_instrumentor_is_left_unchanged(
@@ -395,6 +421,21 @@ def test_existing_host_langchain_instrumentor_is_left_unchanged(
     phoenix.shutdown_phoenix_tracing()
     assert fake_instrumentor.uninstrument_calls == 0
     assert provider.events == [("force_flush", 30_000), ("shutdown", None)]
+    assert _boundary_io_processors(provider) == []
+
+
+def test_manual_only_mode_does_not_install_boundary_io_processor(
+    monkeypatch,
+    _reject_entry_point_enumeration,
+):
+    from deerflow.tracing import phoenix
+
+    provider = _RecordingProvider()
+    monkeypatch.setattr("phoenix.otel.register", lambda **_kwargs: provider)
+
+    phoenix.ensure_phoenix_tracing_initialized(_config(auto_instrument=False, capture_content=True))
+
+    assert _boundary_io_processors(provider) == []
 
 
 def test_instrument_failure_closes_provider_and_allows_retry(
