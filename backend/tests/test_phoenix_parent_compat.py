@@ -466,6 +466,22 @@ def _assert_run_boundary_is_distinct_from_graph_span(
     assert graph_spans[0].name != boundary_span.name
 
 
+_BOUNDARY_IO_ATTRIBUTES = (
+    "input.value",
+    "input.mime_type",
+    "output.value",
+    "output.mime_type",
+)
+
+
+def _assert_boundary_io_matches_graph(boundary_span: Any, graph_span: Any) -> None:
+    for attribute in _BOUNDARY_IO_ATTRIBUTES:
+        if attribute in graph_span.attributes:
+            assert boundary_span.attributes[attribute] == graph_span.attributes[attribute]
+        else:
+            assert attribute not in boundary_span.attributes
+
+
 def _graph_root_binding_api():
     from deerflow.tracing import phoenix
 
@@ -545,6 +561,9 @@ def test_graph_root_override_wins_only_for_exact_run_id_and_is_consumed(parent_r
         boundary_span=boundary_span,
         graph_span=graph_span,
     )
+    _assert_boundary_io_matches_graph(boundary_span, graph_span)
+    assert boundary_span.attributes["input.value"] != ordinary_span.attributes["input.value"]
+    assert boundary_span.attributes["output.value"] != ordinary_span.attributes["output.value"]
     assert ordinary_span.parent is not None
     assert ordinary_span.parent.span_id == task_span.context.span_id
 
@@ -721,7 +740,10 @@ def test_real_create_agent_entries_keep_distinct_run_boundary_and_graph_spans(
         graph_run_name=entry_name,
         agent_name=entry_name,
     )
-    boundary = next(span for span in parent_runtime["exporter"].get_finished_spans() if span.attributes.get("deerflow.span.role") == "run_boundary")
+    spans = parent_runtime["exporter"].get_finished_spans()
+    boundary = next(span for span in spans if span.attributes.get("deerflow.span.role") == "run_boundary")
+    graph = next(span for span in spans if span.name == entry_name)
+    _assert_boundary_io_matches_graph(boundary, graph)
     assert boundary.status.status_code == StatusCode.UNSET
 
 
@@ -872,6 +894,9 @@ async def test_real_exporter_accepts_production_main_and_embedded_entries(
     )
     boundary = next(span for span in parent_runtime["exporter"].get_finished_spans() if span.attributes.get("deerflow.span.role") == "run_boundary")
     assert boundary.status.status_code == StatusCode.OK
+    spans = parent_runtime["exporter"].get_finished_spans()
+    graph = next(span for span in spans if span.name == graph_run_name)
+    _assert_boundary_io_matches_graph(boundary, graph)
 
 
 class _RemoveAfterCaptureRegistry(dict[UUID, Any]):
