@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from langchain_core.messages import HumanMessage
 
 from deerflow.config.app_config import AppConfig
-from deerflow.config.tracing_config import get_tracing_config
 from deerflow.runtime.serialization import serialize
 from deerflow.runtime.stream_bridge import StreamBridge
 from deerflow.runtime.user_context import get_effective_user_id
@@ -40,7 +39,7 @@ from deerflow.tracing import (
     activate_phoenix_root_context,
     build_phoenix_correlation_metadata,
     deserialize_trace_context,
-    inject_trace_metadata,
+    inject_langfuse_metadata,
 )
 
 from .manager import RunManager, RunRecord
@@ -245,22 +244,17 @@ async def run_agent(
         config.setdefault("run_name", resolve_root_run_name(config, record.assistant_id))
         authoritative_assistant_id = record.assistant_id or "lead_agent"
 
-        # Inject provider-neutral root trace metadata so the worker and the
-        # embedded client stay aligned; Langfuse reserved keys continue to flow
-        # through the shared helper.
+        # Inject Langfuse trace metadata only; Phoenix export metadata is built
+        # separately as a correlation view so canonical metadata stays unchanged.
         effective_user_id = get_effective_user_id()
         environment = os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT")
-        caller_metadata = dict(config.get("metadata") or {})
-        inject_trace_metadata(
+        inject_langfuse_metadata(
             config,
             thread_id=thread_id,
             user_id=effective_user_id,
             assistant_id=authoritative_assistant_id,
             model_name=record.model_name,
             environment=environment,
-            caller_tags=config.get("tags"),
-            root_run_name=config.get("run_name"),
-            run_id=run_id,
         )
 
         # Resolve after runtime context installation so context/configurable reflect
@@ -271,38 +265,21 @@ async def run_agent(
         else:
             agent = agent_factory(config=runnable_config)
 
-        # Capture the effective model from the factory-mutated RunnableConfig.
-        # For a non-empty request, retain the existing agent metadata fallback
-        # because the factory may expose a remap there instead.
+        # Capture the effective model from the factory or agent metadata.
+        # Caller-provided ``model_name`` in ``RunnableConfig.metadata`` is part of
+        # canonical metadata and is intentionally not used here; the resolved model
+        # comes from the record or the agent factory's own metadata.
         factory_metadata = runnable_config.get("metadata") or {}
-        effective_model_name = factory_metadata.get("model_name", record.model_name)
-        if record.model_name is not None:
-            resolved = getattr(agent, "metadata", {}) or {}
-            if isinstance(resolved, dict):
-                effective = resolved.get("model_name")
-                if effective and effective != record.model_name:
-                    await run_manager.update_model_name(record.run_id, effective)
-                if effective:
-                    effective_model_name = effective
-
-        # Agent factories receive a shallow RunnableConfig copy and may append
-        # metadata while resolving the model. Rebuild the safe metadata from the
-        # original caller snapshot, then update the exact config passed to astream.
-        phoenix_config = get_tracing_config().phoenix
-        if phoenix_config.enabled and not phoenix_config.capture_content:
-            config["metadata"] = caller_metadata
-            inject_trace_metadata(
-                config,
-                thread_id=thread_id,
-                user_id=effective_user_id,
-                assistant_id=authoritative_assistant_id,
-                model_name=effective_model_name,
-                environment=environment,
-                caller_tags=config.get("tags"),
-                root_run_name=config.get("run_name"),
-                run_id=run_id,
-            )
-            runnable_config["metadata"] = config["metadata"]
+        effective_model_name = record.model_name
+        resolved = getattr(agent, "metadata", {}) or {}
+        if isinstance(resolved, dict):
+            resolved_model_name = resolved.get("model_name")
+            if resolved_model_name:
+                if record.model_name is not None and resolved_model_name != record.model_name:
+                    await run_manager.update_model_name(record.run_id, resolved_model_name)
+                effective_model_name = resolved_model_name
+        if effective_model_name is None:
+            effective_model_name = factory_metadata.get("model_name")
 
         # 4. Attach checkpointer and store
         if checkpointer is not None:
@@ -348,12 +325,13 @@ async def run_agent(
             upstream_context = deserialize_trace_context(runtime_context_config.get(DEERFLOW_OTEL_TRACE_CONTEXT))
 
         root_run_name = str(config.get("run_name") or resolve_root_run_name(config, record.assistant_id))
+        canonical_metadata = dict(runnable_config.get("metadata") or {})
         root_context = PhoenixRootContext(
             run_name=root_run_name,
             session_id=thread_id,
             user_id=effective_user_id,
-            metadata=dict(config.get("metadata") or {}),
-            tags=list(config.get("tags") or []),
+            metadata=canonical_metadata,
+            tags=list(runnable_config.get("tags") or []),
             agent_name=authoritative_assistant_id,
             correlation_metadata=build_phoenix_correlation_metadata(
                 thread_id=thread_id,
@@ -361,7 +339,7 @@ async def run_agent(
                 assistant_id=authoritative_assistant_id,
                 model_name=effective_model_name,
                 environment=environment,
-                caller_metadata=dict(config.get("metadata") or {}),
+                caller_metadata=canonical_metadata,
                 root_run_name=root_run_name,
                 run_id=run_id,
             ),

@@ -369,7 +369,7 @@ def test_stream_keeps_graph_root_callbacks_and_metadata(monkeypatch):
             "request_id": "request-123",
             "tenant_id": "tenant-456",
             "langfuse_session_id": "caller-controlled-session",
-            "unlisted": "must-not-export",
+            "private": {"values": [1, 2, 3]},
             "session_id": "caller-session",
         }
         cfg["tags"] = ["caller-tag"]
@@ -401,17 +401,21 @@ def test_stream_keeps_graph_root_callbacks_and_metadata(monkeypatch):
         "root_run_name": "lead-agent",
         "caller_tags": None,
     }
+    # Canonical metadata preserves caller values, including nested private ones.
     assert metadata == {
-        "langfuse_session_id": "thread-client-phoenix-4",
+        "request_id": "request-123",
+        "tenant_id": "tenant-456",
+        "langfuse_session_id": "caller-controlled-session",
+        "private": {"values": [1, 2, 3]},
+        "session_id": "caller-session",
         "langfuse_user_id": "test-user-autouse",
         "langfuse_trace_name": "lead-agent",
         "langfuse_tags": ["model:stub-model"],
-        **expected_phoenix_safe_metadata,
     }
     assert len(entered) == 1
     assert entered[0].metadata == metadata
     assert entered[0].tags == list(config.get("tags") or [])
+    # Phoenix export view remains filtered to the allowlist plus server-owned fields.
     assert entered[0].correlation_metadata == expected_phoenix_safe_metadata
-    assert {key: metadata[key] for key in expected_phoenix_safe_metadata} == entered[0].correlation_metadata
     assert not any(key.startswith("langfuse_") for key in entered[0].correlation_metadata)
     assert entered[0].correlation_tags == []

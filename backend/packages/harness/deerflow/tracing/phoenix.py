@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import atexit
-import importlib.metadata
+import json
 import logging
-import os
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,6 +10,8 @@ from hashlib import sha256
 from typing import Any
 from uuid import UUID
 
+from openinference.instrumentation import config as oi_config
+from openinference.semconv.trace import SpanAttributes
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
 from opentelemetry.context import Context
 from opentelemetry.trace import get_current_span
@@ -24,7 +24,141 @@ from deerflow.tracing.otel_context import (
     capture_trace_context_from_span_context,
 )
 
-type _PhoenixConfigKey = tuple[str, str, bool, bool, bool, str | None]
+type _PhoenixConfigKey = tuple[
+    str,
+    str,
+    bool,
+    bool,
+    bool,
+    str | None,
+    tuple[str, ...],
+]
+
+_SAFE_MODE_DROP_KEY_MARKERS = (
+    "retrieval.documents",
+    "llm.prompt_template",
+    "llm.function_call",
+)
+
+_TRUSTED_METADATA_CONTEXT_KEY = "deerflow.tracing.trusted_metadata"
+
+
+@contextmanager
+def _trusted_metadata_context(metadata: dict[str, Any]) -> Iterator[None]:
+    """Attach DeerFlow's trusted metadata under a private context key.
+
+    This key is only set by DeerFlow's own run boundary, so it cannot be
+    forged by nested or third-party OpenInference instrumentation.
+    """
+    from opentelemetry import context as otel_context
+
+    token = otel_context.attach(otel_context.set_value(_TRUSTED_METADATA_CONTEXT_KEY, metadata))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
+class DeerFlowTraceConfig(oi_config.TraceConfig):
+    """Instance-local safe-capture policy for DeerFlow's Phoenix export.
+
+    Delegates content hiding to the upstream ``TraceConfig`` and extends it
+    where the locked LangChain tracer has no hide flag: safe mode also drops
+    retriever documents, prompt templates, and top-level function-call
+    arguments, and applies an exact allowlist to ``SpanAttributes.METADATA``.
+    Every upstream field is initialized explicitly, so no process-level
+    ``OPENINFERENCE_*`` environment variable is read or written.
+
+    While a DeerFlow ``deerflow.run`` boundary is active (``using_attributes``
+    context), its session id and correlation metadata win over caller-supplied
+    values, so caller metadata cannot forge DeerFlow's trusted correlation.
+    """
+
+    def __init__(
+        self,
+        *,
+        capture_content: bool,
+        metadata_allowlist: tuple[str, ...],
+    ) -> None:
+        hidden = not capture_content
+        super().__init__(
+            hide_inputs=hidden,
+            hide_outputs=hidden,
+            hide_input_messages=hidden,
+            hide_output_messages=hidden,
+            hide_input_images=hidden,
+            hide_input_text=hidden,
+            hide_output_text=hidden,
+            hide_prompts=hidden,
+            hide_choices=hidden,
+            hide_llm_invocation_parameters=hidden,
+            hide_llm_tools=hidden,
+            hide_embedding_vectors=hidden,
+            hide_embeddings_vectors=hidden,
+            hide_embeddings_text=hidden,
+            enable_genai_semconv=False,
+            base64_image_max_length=32_000,
+        )
+        object.__setattr__(self, "_deerflow_capture_content", capture_content)
+        object.__setattr__(self, "_deerflow_metadata_allowlist", frozenset(metadata_allowlist))
+
+    def mask(self, key: str, value: Any) -> Any:
+        masked = super().mask(key, value)
+        if masked is None:
+            return None
+        if key == SpanAttributes.SESSION_ID:
+            context_session_id = self._context_value(SpanAttributes.SESSION_ID)
+            if context_session_id is not None:
+                return context_session_id
+            return masked
+        if key == SpanAttributes.METADATA:
+            return self._mask_metadata(masked)
+        if self._deerflow_capture_content:
+            return masked
+        if any(marker in key for marker in _SAFE_MODE_DROP_KEY_MARKERS):
+            return None
+        return masked
+
+    def _mask_metadata(self, masked: Any) -> Any:
+        trusted = self._trusted_metadata() or {}
+        context_metadata = self._context_metadata() or {}
+        try:
+            decoded = json.loads(masked)
+        except (TypeError, ValueError):
+            decoded = None
+        if not isinstance(decoded, dict):
+            return masked if self._deerflow_capture_content else None
+        if self._deerflow_capture_content:
+            if context_metadata or trusted:
+                merged = {**decoded, **context_metadata, **trusted}
+                return json.dumps(merged, sort_keys=True, separators=(",", ":"))
+            return masked
+
+        merged = {**decoded, **context_metadata}
+        filtered = {name: item for name, item in merged.items() if name in self._deerflow_metadata_allowlist and not name.startswith("langfuse_")}
+        filtered.update(trusted)
+        return json.dumps(filtered, sort_keys=True, separators=(",", ":")) if filtered else None
+
+    def _trusted_metadata(self) -> dict[str, Any] | None:
+        raw = self._context_value(_TRUSTED_METADATA_CONTEXT_KEY)
+        return raw if isinstance(raw, dict) else None
+
+    def _context_metadata(self) -> dict[str, Any] | None:
+        raw = self._context_value(SpanAttributes.METADATA)
+        if not isinstance(raw, str):
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    @staticmethod
+    def _context_value(key: str) -> Any:
+        from opentelemetry import context as context_api
+
+        return context_api.get_value(key)
+
 
 _PARENT_COMPAT_DEPENDENCY_VERSIONS = {
     "langchain": "1.2.15",
@@ -37,11 +171,12 @@ _graph_root_parent_override_lock = threading.Lock()
 _graph_root_parent_overrides: dict[UUID, Any] = {}
 _active_config_key: _PhoenixConfigKey | None = None
 _phoenix_tracer_provider: Any | None = None
+_phoenix_trace_config: DeerFlowTraceConfig | None = None
 _parent_compat_tracer: Any | None = None
 _parent_compat_base_class: type[Any] | None = None
 _parent_compat_class: type[Any] | None = None
-_phoenix_owned_instrumentors: list[_InstrumentorSnapshot] = []
-_content_capture_environment: dict[str, str | None] | None = None
+_phoenix_owned_langchain_instrumentor: Any | None = None
+_langchain_instrumentor: Any | None = None
 _RUN_BOUNDARY_SPAN_NAME = "deerflow.run"
 _DEFAULT_SHUTDOWN_TIMEOUT_MILLIS = 30_000
 
@@ -82,11 +217,14 @@ def capture_current_phoenix_trace_context(
     return capture_current_trace_context(include_baggage=include_baggage)
 
 
-@dataclass(frozen=True)
-class _InstrumentorSnapshot:
-    instrumentor: Any
-    instance_state: dict[str, Any]
-    was_instrumented: bool
+def _get_langchain_instrumentor() -> Any:
+    """Lazy import of ``LangChainInstrumentor`` to avoid loading on disabled paths."""
+    global _langchain_instrumentor
+    if _langchain_instrumentor is None:
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+
+        _langchain_instrumentor = LangChainInstrumentor
+    return _langchain_instrumentor
 
 
 @dataclass(frozen=True)
@@ -104,8 +242,8 @@ class PhoenixRootContext:
 
 def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = None) -> None:
     """Lazy, process-wide, idempotent Phoenix/OpenInference setup."""
-    global _active_config_key, _content_capture_environment, _phoenix_owned_instrumentors
-    global _phoenix_tracer_provider
+    global _active_config_key, _phoenix_owned_langchain_instrumentor
+    global _phoenix_trace_config, _phoenix_tracer_provider
 
     phoenix_config = config or get_tracing_config().phoenix
     if not phoenix_config.enabled:
@@ -118,17 +256,13 @@ def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = Non
                 return
             raise PhoenixTracingError("Phoenix tracing is already initialized with a different active configuration.")
 
+        trace_config = DeerFlowTraceConfig(
+            capture_content=phoenix_config.capture_content,
+            metadata_allowlist=tuple(phoenix_config.metadata_allowlist),
+        )
         tracer_provider: Any | None = None
-        content_capture_environment: dict[str, str | None] | None = None
-        instrumentor_snapshots: list[_InstrumentorSnapshot] = []
-        attempted_instrumentors: list[_InstrumentorSnapshot] = []
-        owned_instrumentors: list[_InstrumentorSnapshot] = []
+        owned_instrumentor: Any | None = None
         try:
-            if not phoenix_config.capture_content:
-                content_capture_environment = _disable_openinference_content_capture()
-            if phoenix_config.auto_instrument:
-                instrumentor_snapshots = _snapshot_openinference_instrumentors()
-
             from phoenix.otel import register
 
             register_kwargs = {
@@ -137,33 +271,39 @@ def ensure_phoenix_tracing_initialized(config: PhoenixTracingConfig | None = Non
                 "auto_instrument": False,
                 "set_global_tracer_provider": False,
                 "batch": True,
+                "shutdown_on_exit": False,
             }
             if phoenix_config.api_key:
                 register_kwargs["api_key"] = phoenix_config.api_key
             tracer_provider = register(**register_kwargs)
             if phoenix_config.auto_instrument:
-                _reject_foreign_instrumentors(instrumentor_snapshots)
-                _validate_openinference_langchain_parent_contract()
-                for snapshot in instrumentor_snapshots:
-                    attempted_instrumentors.append(snapshot)
-                    snapshot.instrumentor.instrument(tracer_provider=tracer_provider)
-                    if not getattr(snapshot.instrumentor, "_is_instrumented_by_opentelemetry", False):
-                        raise PhoenixTracingError("Phoenix tracing could not instrument an OpenInference entry point.")
-                    owned_instrumentors.append(snapshot)
-                _install_openinference_langchain_parent_compat(tracer_provider)
+                instrumentor = _get_langchain_instrumentor()()
+                if not instrumentor.is_instrumented_by_opentelemetry:
+                    instrumentor.instrument(
+                        tracer_provider=tracer_provider,
+                        config=trace_config,
+                    )
+                    if not instrumentor.is_instrumented_by_opentelemetry:
+                        raise PhoenixTracingError("Phoenix tracing could not instrument LangChain.")
+                    owned_instrumentor = instrumentor
+                    _install_openinference_langchain_parent_compat(tracer_provider)
+                else:
+                    logger.warning("Phoenix tracing left an existing host-owned LangChain instrumentor unchanged; only DeerFlow manual run spans are guaranteed on the Phoenix provider.")
         except Exception as exc:
-            _rollback_instrumentors(attempted_instrumentors)
+            if owned_instrumentor is not None:
+                try:
+                    owned_instrumentor.uninstrument()
+                except Exception:
+                    logger.exception("Phoenix tracing could not uninstrument the owned LangChain instrumentor during failure cleanup.")
             _clear_phoenix_state()
-            if content_capture_environment is not None:
-                _restore_openinference_content_capture(content_capture_environment)
             if tracer_provider is not None:
                 _shutdown_provider(tracer_provider, force_flush=False)
             raise PhoenixTracingError(f"Phoenix tracing initialization failed: {exc}") from exc
 
         _phoenix_tracer_provider = tracer_provider
+        _phoenix_trace_config = trace_config
         _active_config_key = config_key
-        _phoenix_owned_instrumentors = owned_instrumentors
-        _content_capture_environment = content_capture_environment
+        _phoenix_owned_langchain_instrumentor = owned_instrumentor
 
 
 def shutdown_phoenix_tracing(*, timeout_millis: int = _DEFAULT_SHUTDOWN_TIMEOUT_MILLIS) -> None:
@@ -172,7 +312,13 @@ def shutdown_phoenix_tracing(*, timeout_millis: int = _DEFAULT_SHUTDOWN_TIMEOUT_
 
     with _init_lock:
         tracer_provider = _phoenix_tracer_provider
+        owned_instrumentor = _phoenix_owned_langchain_instrumentor
         _clear_phoenix_state()
+        if owned_instrumentor is not None:
+            try:
+                owned_instrumentor.uninstrument()
+            except Exception:
+                logger.exception("Phoenix tracing could not uninstrument the owned LangChain instrumentor during shutdown.")
         if tracer_provider is not None:
             _shutdown_provider(tracer_provider, timeout_millis=timeout_millis)
 
@@ -259,10 +405,25 @@ def activate_phoenix_root_context(root: PhoenixRootContext) -> Iterator[PhoenixR
     except Exception as exc:
         raise PhoenixTracingError(f"Phoenix root context activation failed: {exc}") from exc
 
-    token = otel_context.attach(resolved_context)
+    if phoenix_config.capture_content:
+        from deerflow.tracing import metadata as tracing_metadata
 
-    export_metadata = root.metadata if phoenix_config.capture_content else root.correlation_metadata
-    export_tags = root.tags if phoenix_config.capture_content else root.correlation_tags
+        export_metadata = tracing_metadata._copy_caller_metadata_for_export(
+            root.metadata,
+            capture_content=True,
+        )
+        export_tags = root.tags
+    else:
+        export_metadata = root.correlation_metadata
+        export_tags = root.correlation_tags
+
+    token = otel_context.attach(
+        otel_context.set_value(
+            _TRUSTED_METADATA_CONTEXT_KEY,
+            root.correlation_metadata,
+            context=resolved_context,
+        )
+    )
 
     try:
         with using_attributes(
@@ -328,8 +489,17 @@ class PhoenixRootScope:
         except Exception as exc:
             raise PhoenixTracingError(f"Phoenix root scope start failed: {exc}") from exc
 
-        export_metadata = self._root.metadata if phoenix_config.capture_content else self._root.correlation_metadata
-        export_tags = self._root.tags if phoenix_config.capture_content else self._root.correlation_tags
+        if phoenix_config.capture_content:
+            from deerflow.tracing import metadata as tracing_metadata
+
+            export_metadata = tracing_metadata._copy_caller_metadata_for_export(
+                self._root.metadata,
+                capture_content=True,
+            )
+            export_tags = self._root.tags
+        else:
+            export_metadata = self._root.correlation_metadata
+            export_tags = self._root.correlation_tags
 
         tracer = _get_phoenix_tracer(__name__)
         span = tracer.start_span(_RUN_BOUNDARY_SPAN_NAME, context=resolved_context)
@@ -345,7 +515,12 @@ class PhoenixRootScope:
         )
 
         base_context = otel_trace.set_span_in_context(span, resolved_context)
-        token = otel_context.attach(base_context)
+        context_with_trusted = otel_context.set_value(
+            _TRUSTED_METADATA_CONTEXT_KEY,
+            self._root.correlation_metadata,
+            context=base_context,
+        )
+        token = otel_context.attach(context_with_trusted)
         try:
             with using_attributes(
                 session_id=self._root.session_id,
@@ -392,21 +567,23 @@ def open_phoenix_root_scope(root: PhoenixRootContext) -> PhoenixRootScope:
 
 
 def _clear_phoenix_state() -> None:
-    global _active_config_key, _parent_compat_base_class, _parent_compat_class, _parent_compat_tracer
-    global _content_capture_environment, _phoenix_owned_instrumentors, _phoenix_tracer_provider
+    global _active_config_key
+    global _parent_compat_base_class
+    global _parent_compat_class
+    global _parent_compat_tracer
+    global _phoenix_owned_langchain_instrumentor
+    global _phoenix_trace_config
+    global _phoenix_tracer_provider
 
     with _graph_root_parent_override_lock:
         _graph_root_parent_overrides.clear()
     if _parent_compat_tracer is not None and _parent_compat_base_class is not None and _parent_compat_tracer.__class__ is _parent_compat_class:
         _parent_compat_tracer.__class__ = _parent_compat_base_class
-    _uninstrument_owned_instrumentors(_phoenix_owned_instrumentors)
-    if _content_capture_environment is not None:
-        _restore_openinference_content_capture(_content_capture_environment)
     _parent_compat_tracer = None
     _parent_compat_base_class = None
     _parent_compat_class = None
-    _phoenix_owned_instrumentors = []
-    _content_capture_environment = None
+    _phoenix_owned_langchain_instrumentor = None
+    _phoenix_trace_config = None
     _phoenix_tracer_provider = None
     _active_config_key = None
 
@@ -417,7 +594,6 @@ def _shutdown_provider(
     timeout_millis: int = _DEFAULT_SHUTDOWN_TIMEOUT_MILLIS,
     force_flush: bool = True,
 ) -> None:
-    _relinquish_provider_atexit_hook(tracer_provider)
     if force_flush:
         try:
             flushed = tracer_provider.force_flush(timeout_millis=timeout_millis)
@@ -431,68 +607,6 @@ def _shutdown_provider(
         logger.exception("Phoenix tracing provider shutdown failed.")
 
 
-def _relinquish_provider_atexit_hook(tracer_provider: Any) -> None:
-    """Detach the SDK's private exit hook before a blocking exporter operation.
-
-    OpenTelemetry unregisters this hook only after its own shutdown completes.
-    DeerFlow's bounded Gateway shutdown uses a daemon thread, so retaining the
-    hook could otherwise make interpreter exit block on the same provider.
-    """
-    handler = getattr(tracer_provider, "_atexit_handler", None)
-    if handler is None:
-        return
-    try:
-        atexit.unregister(handler)
-    except Exception:
-        logger.exception("Phoenix tracing provider atexit hook could not be unregistered.")
-    finally:
-        tracer_provider._atexit_handler = None
-
-
-def _snapshot_openinference_instrumentors() -> list[_InstrumentorSnapshot]:
-    snapshots: list[_InstrumentorSnapshot] = []
-    for entry_point in importlib.metadata.entry_points(group="openinference_instrumentor"):
-        instrumentor = entry_point.load()()
-        snapshots.append(
-            _InstrumentorSnapshot(
-                instrumentor=instrumentor,
-                instance_state=dict(getattr(instrumentor, "__dict__", {})),
-                was_instrumented=bool(getattr(instrumentor, "_is_instrumented_by_opentelemetry", False)),
-            )
-        )
-    return snapshots
-
-
-def _reject_foreign_instrumentors(snapshots: list[_InstrumentorSnapshot]) -> None:
-    if any(snapshot.was_instrumented for snapshot in snapshots):
-        raise PhoenixTracingError("Phoenix tracing found an OpenInference instrumentor owned by a foreign provider.")
-
-
-def _rollback_instrumentors(snapshots: list[_InstrumentorSnapshot]) -> None:
-    for snapshot in reversed(snapshots):
-        try:
-            snapshot.instrumentor._uninstrument()
-        except Exception:
-            logger.exception("Phoenix tracing could not roll back a partially instrumented entry point.")
-        _restore_instrumentor_snapshot(snapshot)
-
-
-def _uninstrument_owned_instrumentors(snapshots: list[_InstrumentorSnapshot]) -> None:
-    for snapshot in reversed(snapshots):
-        try:
-            snapshot.instrumentor.uninstrument()
-        except Exception:
-            logger.exception("Phoenix tracing could not uninstrument an owned OpenInference entry point.")
-        _restore_instrumentor_snapshot(snapshot)
-
-
-def _restore_instrumentor_snapshot(snapshot: _InstrumentorSnapshot) -> None:
-    instance_state = getattr(snapshot.instrumentor, "__dict__", None)
-    if instance_state is not None:
-        instance_state.clear()
-        instance_state.update(snapshot.instance_state)
-
-
 def _config_key(config: PhoenixTracingConfig) -> _PhoenixConfigKey:
     api_key = sha256(config.api_key.encode("utf-8")).hexdigest() if config.api_key else None
     return (
@@ -502,6 +616,7 @@ def _config_key(config: PhoenixTracingConfig) -> _PhoenixConfigKey:
         config.capture_content,
         api_key is not None,
         api_key,
+        tuple(config.metadata_allowlist),
     )
 
 
@@ -679,36 +794,3 @@ def _install_openinference_langchain_parent_compat(tracer_provider: Any) -> None
     _parent_compat_base_class = OpenInferenceTracer
     _parent_compat_class = PhoenixParentCompatOpenInferenceTracer
     tracer.__class__ = PhoenixParentCompatOpenInferenceTracer
-
-
-def _disable_openinference_content_capture() -> dict[str, str | None]:
-    from openinference.instrumentation import config as openinference_config
-
-    previous_values: dict[str, str | None] = {}
-    for attr_name in (
-        "OPENINFERENCE_HIDE_INPUTS",
-        "OPENINFERENCE_HIDE_OUTPUTS",
-        "OPENINFERENCE_HIDE_INPUT_MESSAGES",
-        "OPENINFERENCE_HIDE_OUTPUT_MESSAGES",
-        "OPENINFERENCE_HIDE_PROMPTS",
-        "OPENINFERENCE_HIDE_CHOICES",
-        "OPENINFERENCE_HIDE_INPUT_TEXT",
-        "OPENINFERENCE_HIDE_OUTPUT_TEXT",
-        "OPENINFERENCE_HIDE_LLM_INVOCATION_PARAMETERS",
-        "OPENINFERENCE_HIDE_LLM_TOOLS",
-    ):
-        env_name = getattr(openinference_config, attr_name, None)
-        if env_name:
-            previous_values[env_name] = os.environ.get(env_name)
-            os.environ[env_name] = "true"
-    return previous_values
-
-
-def _restore_openinference_content_capture(previous_values: dict[str, str | None]) -> None:
-    for env_name, value in previous_values.items():
-        if os.environ.get(env_name) != "true":
-            continue
-        if value is None:
-            os.environ.pop(env_name, None)
-        else:
-            os.environ[env_name] = value

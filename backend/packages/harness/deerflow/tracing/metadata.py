@@ -16,15 +16,63 @@ right metadata without leaking Langfuse internals into the call sites.
 
 from __future__ import annotations
 
+import copy
+import json
+import logging
 from typing import Any
 
 from deerflow.config import get_enabled_tracing_providers
 from deerflow.config.tracing_config import get_tracing_config
 
+logger = logging.getLogger(__name__)
+_UNEXPORTABLE = object()
+
+
 # Lazy-imported below to avoid a circular import: ``deerflow.runtime`` eagerly
 # imports the run worker, which in turn needs ``deerflow.tracing``.
 _DEFAULT_TRACE_NAME = "lead-agent"
 _OTHER_PROVIDER_RESERVED_METADATA_PREFIXES = ("langfuse_",)
+
+
+def _copy_phoenix_export_value(key: str, value: Any) -> Any:
+    try:
+        copied = copy.deepcopy(value)
+        serialized = json.dumps(copied, default=str, ensure_ascii=False)
+        return json.loads(serialized)
+    except Exception:
+        logger.warning(
+            "Skipping Phoenix metadata field %s because %s cannot be copied or serialized.",
+            key,
+            type(value).__name__,
+        )
+        return _UNEXPORTABLE
+
+
+def _copy_caller_metadata_for_export(
+    caller_metadata: dict[str, Any] | None,
+    *,
+    capture_content: bool,
+    allowlist: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Return a deep, JSON-stable copy of caller metadata for Phoenix export.
+
+    When ``capture_content`` is true every caller key except reserved prefixes
+    is copied.  In safe mode only ``allowlist`` keys are copied.  Values that
+    cannot be deep-copied or serialized are dropped per-field.
+    """
+    if caller_metadata is None:
+        return {}
+    result: dict[str, Any] = {}
+    keys = caller_metadata.keys() if capture_content else (allowlist or ())
+    for key in keys:
+        if key.startswith(_OTHER_PROVIDER_RESERVED_METADATA_PREFIXES):
+            continue
+        if key not in caller_metadata:
+            continue
+        copied = _copy_phoenix_export_value(key, caller_metadata[key])
+        if copied is not _UNEXPORTABLE:
+            result[key] = copied
+    return result
 
 
 def _build_langfuse_trace_metadata_unchecked(
@@ -89,56 +137,6 @@ def build_langfuse_trace_metadata(
     )
 
 
-def build_trace_metadata(
-    *,
-    thread_id: str | None,
-    user_id: str | None = None,
-    assistant_id: str | None = None,
-    model_name: str | None = None,
-    environment: str | None = None,
-    caller_metadata: dict[str, Any] | None = None,
-    caller_tags: list[str] | None = None,
-    root_run_name: str | None = None,
-    run_id: str | None = None,
-) -> dict[str, Any]:
-    """Return provider-neutral root trace metadata.
-
-    Langfuse keeps its existing reserved ``langfuse_*`` contract. Phoenix uses
-    provider-neutral correlation keys so root runtime contexts can apply them
-    through OpenInference attributes.
-    """
-    providers = set(get_enabled_tracing_providers())
-    metadata: dict[str, Any] = {}
-
-    if "langfuse" in providers:
-        metadata.update(
-            _build_langfuse_trace_metadata_unchecked(
-                thread_id=thread_id,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                model_name=model_name,
-                environment=environment,
-            )
-        )
-
-    if "phoenix" in providers:
-        phoenix_metadata = build_phoenix_correlation_metadata(
-            thread_id=thread_id,
-            user_id=user_id,
-            assistant_id=assistant_id,
-            model_name=model_name,
-            environment=environment,
-            caller_metadata=caller_metadata,
-            caller_tags=caller_tags,
-            root_run_name=root_run_name,
-            run_id=run_id,
-        )
-        for key, value in phoenix_metadata.items():
-            metadata.setdefault(key, value)
-
-    return metadata
-
-
 def build_phoenix_correlation_metadata(
     *,
     thread_id: str | None,
@@ -151,13 +149,27 @@ def build_phoenix_correlation_metadata(
     root_run_name: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build the bounded metadata set that Phoenix may export without content."""
+    """Build the bounded metadata set that Phoenix may export without content.
+
+    This function operates on a copy of *caller_metadata*; it never mutates the
+    source mapping or nested values passed to LangGraph/business consumers.
+    """
     phoenix_config = get_tracing_config().phoenix
-    metadata = {
-        key: caller_metadata[key]
-        for key in phoenix_config.metadata_allowlist
-        if (not phoenix_config.capture_content and caller_metadata is not None and key in caller_metadata and not key.startswith(_OTHER_PROVIDER_RESERVED_METADATA_PREFIXES))
-    }
+    metadata: dict[str, Any] = {}
+    if caller_metadata is not None:
+        if phoenix_config.capture_content:
+            for key, value in caller_metadata.items():
+                if not key.startswith(_OTHER_PROVIDER_RESERVED_METADATA_PREFIXES):
+                    copied = _copy_phoenix_export_value(key, value)
+                    if copied is not _UNEXPORTABLE:
+                        metadata[key] = copied
+        else:
+            for key in phoenix_config.metadata_allowlist:
+                if key in caller_metadata and not key.startswith(_OTHER_PROVIDER_RESERVED_METADATA_PREFIXES):
+                    value = caller_metadata[key]
+                    copied = _copy_phoenix_export_value(key, value)
+                    if copied is not _UNEXPORTABLE:
+                        metadata[key] = copied
     metadata.update(
         {
             "session_id": thread_id,
@@ -207,31 +219,4 @@ def inject_langfuse_metadata(
     merged_metadata = dict(config.get("metadata") or {})
     for key, value in langfuse_metadata.items():
         merged_metadata.setdefault(key, value)
-    config["metadata"] = merged_metadata
-
-
-def inject_trace_metadata(config: dict, *, trusted_caller_tags: bool = False, **kwargs: Any) -> None:
-    """Merge provider-neutral trace metadata into ``config["metadata"]``.
-
-    Caller-provided metadata normally wins via ``setdefault``. When Phoenix
-    content capture is disabled, arbitrary caller metadata is removed before
-    invocation because the LangChain auto-instrumentor exports it independently
-    of OpenInference input/output masking.
-    """
-    phoenix_config = get_tracing_config().phoenix
-    restrict_phoenix_metadata = phoenix_config.enabled and not phoenix_config.capture_content
-    caller_metadata = dict(config.get("metadata") or {})
-    if restrict_phoenix_metadata and not trusted_caller_tags:
-        kwargs = {**kwargs, "caller_tags": None}
-
-    trace_metadata = build_trace_metadata(caller_metadata=caller_metadata, **kwargs)
-    if not trace_metadata:
-        return
-
-    merged_metadata = {} if restrict_phoenix_metadata else dict(config.get("metadata") or {})
-    for key, value in trace_metadata.items():
-        if restrict_phoenix_metadata:
-            merged_metadata[key] = value
-        else:
-            merged_metadata.setdefault(key, value)
     config["metadata"] = merged_metadata

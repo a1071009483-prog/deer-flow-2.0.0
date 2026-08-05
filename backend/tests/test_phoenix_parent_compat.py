@@ -110,6 +110,13 @@ def parent_runtime(monkeypatch: pytest.MonkeyPatch):
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     runtime: dict[str, Any] = {"register_calls": []}
     instrumentor = LangChainInstrumentor()
+    # PR1 leaves host-owned instrumentors untouched in production. Tests share
+    # the OpenInference singleton across modules, so reset it here to keep the
+    # exact-parentage regression suite isolated until PR2 deletes it.
+    try:
+        instrumentor.uninstrument()
+    except Exception:
+        pass
     assert not instrumentor._is_instrumented_by_opentelemetry
 
     def register(**kwargs: Any) -> TracerProvider:
@@ -144,6 +151,10 @@ def parent_runtime(monkeypatch: pytest.MonkeyPatch):
     finally:
         phoenix.shutdown_phoenix_tracing()
         provider.shutdown()
+        try:
+            instrumentor.uninstrument()
+        except Exception:
+            pass
 
 
 def _start_business_parent(tracer: OpenInferenceTracer, run_id: UUID, name: str = "business-parent") -> None:
@@ -773,12 +784,10 @@ async def test_worker_aborted_run_boundary_stays_unset(parent_runtime, monkeypat
     monkeypatch.setenv("LANGSMITH_TRACING", "false")
     monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
 
-    from deerflow.runtime.runs import worker as worker_module
     from deerflow.runtime.runs.manager import RunRecord
     from deerflow.runtime.runs.schemas import DisconnectMode, RunStatus
     from deerflow.runtime.runs.worker import RunContext, run_agent
 
-    monkeypatch.setattr(worker_module, "get_tracing_config", lambda: types.SimpleNamespace(phoenix=parent_runtime["config"]))
     tracer = parent_runtime["openinference_tracer"]
     record = RunRecord(
         run_id="run-main-aborted",
@@ -828,12 +837,10 @@ async def test_real_exporter_accepts_production_main_and_embedded_entries(
 
     tracer = parent_runtime["openinference_tracer"]
     if entry_mode == "main":
-        from deerflow.runtime.runs import worker as worker_module
         from deerflow.runtime.runs.manager import RunRecord
         from deerflow.runtime.runs.schemas import DisconnectMode, RunStatus
         from deerflow.runtime.runs.worker import RunContext, run_agent
 
-        monkeypatch.setattr(worker_module, "get_tracing_config", lambda: types.SimpleNamespace(phoenix=parent_runtime["config"]))
         agent = _WorkerGraphAgent(tracer)
         record = RunRecord(
             run_id="run-main-default-assistant",

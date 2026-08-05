@@ -35,7 +35,7 @@ from deerflow.tracing import (
     bind_phoenix_graph_root_parent,
     build_phoenix_correlation_metadata,
     build_tracing_callbacks,
-    inject_trace_metadata,
+    inject_langfuse_metadata,
 )
 
 if TYPE_CHECKING:
@@ -566,16 +566,13 @@ class SubagentExecutor:
 
             environment = os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT")
             root_run_name = str(run_config.get("run_name") or assistant_id)
-            inject_trace_metadata(
+            inject_langfuse_metadata(
                 run_config,
-                trusted_caller_tags=True,
                 thread_id=self.thread_id,
                 user_id=self.user_id,
                 assistant_id=assistant_id,
                 model_name=self.model_name,
                 environment=environment,
-                caller_tags=run_config.get("tags"),
-                root_run_name=root_run_name,
             )
 
             root_context = PhoenixRootContext(

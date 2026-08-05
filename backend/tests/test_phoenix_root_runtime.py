@@ -179,12 +179,9 @@ def _install_fake_phoenix(
     if stub_parent_compat:
         monkeypatch.setattr(phoenix_runtime, "_install_openinference_langchain_parent_compat", lambda *_args: None)
         monkeypatch.setattr(phoenix_runtime, "_validate_openinference_langchain_parent_contract", lambda: None)
-        monkeypatch.setattr(phoenix_runtime, "_snapshot_openinference_instrumentors", lambda: [])
 
 
 def test_phoenix_initializer_is_idempotent_for_same_config(monkeypatch):
-    from openinference.instrumentation import config as real_openinference_config
-
     from deerflow.tracing.phoenix import ensure_phoenix_tracing_initialized
 
     with _initializer_isolation():
@@ -202,14 +199,13 @@ def test_phoenix_initializer_is_idempotent_for_same_config(monkeypatch):
                 "auto_instrument": False,
                 "set_global_tracer_provider": False,
                 "batch": True,
+                "shutdown_on_exit": False,
                 "api_key": "phoenix-key",
             }
         ]
         assert sys.modules["phoenix.otel"].register is not None
-        assert real_openinference_config.OPENINFERENCE_HIDE_INPUTS == "OPENINFERENCE_HIDE_INPUTS"
-        assert real_openinference_config.OPENINFERENCE_HIDE_OUTPUTS == "OPENINFERENCE_HIDE_OUTPUTS"
-        assert os.environ["OPENINFERENCE_HIDE_INPUTS"] == "true"
-        assert os.environ["OPENINFERENCE_HIDE_OUTPUTS"] == "true"
+        assert "OPENINFERENCE_HIDE_INPUTS" not in os.environ
+        assert "OPENINFERENCE_HIDE_OUTPUTS" not in os.environ
         assert calls[0]["api_key"] == "phoenix-key"
 
 
@@ -312,70 +308,76 @@ def test_failed_registration_leaves_no_parent_compat_residual_and_can_retry(monk
 def test_parent_compat_only_wraps_phoenix_owned_tracer_instance(monkeypatch):
     from openinference.instrumentation.langchain import LangChainInstrumentor
     from openinference.instrumentation.langchain._tracer import OpenInferenceTracer
+    from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
 
     from deerflow.tracing import phoenix
 
     original_start_trace = inspect.unwrap(OpenInferenceTracer._start_trace)
-    instrumentor = LangChainInstrumentor()
-    unrelated_provider = TracerProvider()
+    host_provider = TracerProvider()
     phoenix_provider = TracerProvider()
-    unrelated_before = OpenInferenceTracer(
-        unrelated_provider.get_tracer("deerflow.tests.unrelated-before"),
-        separate_trace_from_runtime_context=False,
-    )
-    original_instance_method = unrelated_before._start_trace.__func__
-    phoenix_tracer = OpenInferenceTracer(
-        phoenix_provider.get_tracer("deerflow.tests.phoenix-owned"),
-        separate_trace_from_runtime_context=False,
-    )
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", host_provider)
 
     def register(**_kwargs):
-        instrumentor._tracer = phoenix_tracer
         return phoenix_provider
 
     _install_fake_phoenix(monkeypatch, register, stub_parent_compat=False)
-    monkeypatch.setattr(phoenix, "_snapshot_openinference_instrumentors", lambda: [])
+    monkeypatch.setattr(phoenix, "_validate_openinference_langchain_parent_contract", lambda: None)
 
-    with _initializer_isolation():
-        phoenix.ensure_phoenix_tracing_initialized(_phoenix_config(capture_content=True))
-        installed_method = phoenix_tracer._start_trace.__func__
-        phoenix.ensure_phoenix_tracing_initialized(_phoenix_config(capture_content=True))
-        unrelated_after = OpenInferenceTracer(
-            unrelated_provider.get_tracer("deerflow.tests.unrelated-after"),
-            separate_trace_from_runtime_context=False,
-        )
+    unrelated_before = OpenInferenceTracer(
+        host_provider.get_tracer("deerflow.tests.unrelated-before"),
+        separate_trace_from_runtime_context=False,
+    )
+    original_instance_method = unrelated_before._start_trace.__func__
 
-        assert installed_method is not original_instance_method
-        assert phoenix_tracer._start_trace.__func__ is installed_method
-        assert unrelated_before._start_trace.__func__ is original_instance_method
-        assert unrelated_after._start_trace.__func__ is original_instance_method
-        assert inspect.unwrap(OpenInferenceTracer._start_trace) is original_start_trace
-        unrelated_provider.shutdown()
+    instrumentor = LangChainInstrumentor()
+    instrumentor.uninstrument()
+    try:
+        with _initializer_isolation():
+            phoenix.ensure_phoenix_tracing_initialized(_phoenix_config(capture_content=True))
+            owned_tracer = instrumentor._tracer
+            installed_method = owned_tracer._start_trace.__func__
+            phoenix.ensure_phoenix_tracing_initialized(_phoenix_config(capture_content=True))
+            unrelated_after = OpenInferenceTracer(
+                host_provider.get_tracer("deerflow.tests.unrelated-after"),
+                separate_trace_from_runtime_context=False,
+            )
+
+            assert installed_method is not original_instance_method
+            assert owned_tracer._start_trace.__func__ is installed_method
+            assert unrelated_before._start_trace.__func__ is original_instance_method
+            assert unrelated_after._start_trace.__func__ is original_instance_method
+            assert inspect.unwrap(OpenInferenceTracer._start_trace) is original_start_trace
+    finally:
+        instrumentor.uninstrument()
+        host_provider.shutdown()
         phoenix_provider.shutdown()
 
 
-def test_content_capture_disabled_sets_openinference_suppression(monkeypatch):
+def test_content_capture_disabled_does_not_mutate_environment(monkeypatch):
     from deerflow.tracing.phoenix import ensure_phoenix_tracing_initialized
 
     with _initializer_isolation():
         _install_fake_phoenix(monkeypatch, lambda **_kwargs: object())
 
-        ensure_phoenix_tracing_initialized(_phoenix_config(capture_content=False))
+        before = {name: os.environ.get(name) for name in OPENINFERENCE_HIDE_NAMES}
+        ensure_phoenix_tracing_initialized(_phoenix_config(auto_instrument=False, capture_content=False))
 
-        for env_name in (
-            "OPENINFERENCE_HIDE_INPUTS",
-            "OPENINFERENCE_HIDE_OUTPUTS",
-            "OPENINFERENCE_HIDE_INPUT_MESSAGES",
-            "OPENINFERENCE_HIDE_OUTPUT_MESSAGES",
-            "OPENINFERENCE_HIDE_PROMPTS",
-            "OPENINFERENCE_HIDE_CHOICES",
-            "OPENINFERENCE_HIDE_INPUT_TEXT",
-            "OPENINFERENCE_HIDE_OUTPUT_TEXT",
-            "OPENINFERENCE_HIDE_LLM_INVOCATION_PARAMETERS",
-            "OPENINFERENCE_HIDE_LLM_TOOLS",
-        ):
-            assert os.environ[env_name] == "true"
+        assert {name: os.environ.get(name) for name in OPENINFERENCE_HIDE_NAMES} == before
+
+
+OPENINFERENCE_HIDE_NAMES = (
+    "OPENINFERENCE_HIDE_INPUTS",
+    "OPENINFERENCE_HIDE_OUTPUTS",
+    "OPENINFERENCE_HIDE_INPUT_MESSAGES",
+    "OPENINFERENCE_HIDE_OUTPUT_MESSAGES",
+    "OPENINFERENCE_HIDE_PROMPTS",
+    "OPENINFERENCE_HIDE_CHOICES",
+    "OPENINFERENCE_HIDE_INPUT_TEXT",
+    "OPENINFERENCE_HIDE_OUTPUT_TEXT",
+    "OPENINFERENCE_HIDE_LLM_INVOCATION_PARAMETERS",
+    "OPENINFERENCE_HIDE_LLM_TOOLS",
+)
 
 
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
